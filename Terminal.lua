@@ -151,12 +151,59 @@ local Themes = {
 	},
 }
 
+local function hx(s)
+	local n = tonumber(s, 16)
+	return Color3.fromRGB(math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256)
+end
+
+-- mk(bg, header, stroke, text, dim, red, green, yellow, blue, magenta, cyan [, bgTransparency])
+local function mk(bg, header, stroke, text, dim, red, green, yellow, blue, magenta, cyan, alpha)
+	return {
+		bg = hx(bg), header = hx(header), stroke = hx(stroke), text = hx(text), dim = hx(dim),
+		user = hx(green), path = hx(blue), bgTransparency = alpha or 0.03,
+		palette = {
+			red = hx(red), green = hx(green), yellow = hx(yellow), blue = hx(blue),
+			magenta = hx(magenta), cyan = hx(cyan), white = hx(text), gray = hx(dim),
+		},
+	}
+end
+
+-- Catppuccin
+Themes["catppuccin-mocha"] = mk("1e1e2e", "181825", "313244", "cdd6f4", "6c7086", "f38ba8", "a6e3a1", "f9e2af", "89b4fa", "cba6f7", "94e2d5")
+Themes["catppuccin-macchiato"] = mk("24273a", "1e2030", "363a4f", "cad3f5", "6e738d", "ed8796", "a6da95", "eed49f", "8aadf4", "c6a0f6", "8bd5ca")
+Themes["catppuccin-frappe"] = mk("303446", "292c3c", "414559", "c6d0f5", "737994", "e78284", "a6d189", "e5c890", "8caaee", "ca9ee6", "81c8be")
+Themes["catppuccin-latte"] = mk("eff1f5", "e6e9ef", "ccd0da", "4c4f69", "9ca0b0", "d20f39", "40a02b", "df8e1d", "1e66f5", "8839ef", "179299", 0.02)
+-- Tokyo Night
+Themes["tokyonight-night"] = mk("1a1b26", "16161e", "292e42", "c0caf5", "565f89", "f7768e", "9ece6a", "e0af68", "7aa2f7", "bb9af7", "7dcfff")
+Themes["tokyonight-storm"] = mk("24283b", "1f2335", "3b4261", "c0caf5", "565f89", "f7768e", "9ece6a", "e0af68", "7aa2f7", "bb9af7", "7dcfff")
+Themes["tokyonight-day"] = mk("e1e2e7", "d0d5e3", "a8aecb", "3760bf", "848cd0", "f52a65", "587539", "8c6c3e", "2e7de9", "9854f1", "007197", 0.02)
+-- Others
+Themes.nord = mk("2e3440", "3b4252", "434c5e", "d8dee9", "616e88", "bf616a", "a3be8c", "ebcb8b", "81a1c1", "b48ead", "88c0d0")
+Themes["solarized-dark"] = mk("002b36", "073642", "0f4a58", "93a1a1", "586e75", "dc322f", "859900", "b58900", "268bd2", "d33682", "2aa198")
+Themes["solarized-light"] = mk("fdf6e3", "eee8d5", "d6cfb8", "586e75", "93a1a1", "dc322f", "859900", "b58900", "268bd2", "d33682", "2aa198", 0.02)
+Themes.onedark = mk("282c34", "21252b", "3e4451", "abb2bf", "5c6370", "e06c75", "98c379", "e5c07b", "61afef", "c678dd", "56b6c2")
+Themes.monokai = mk("272822", "1e1f1c", "3e3d32", "f8f8f2", "75715e", "f92672", "a6e22e", "e6db74", "66d9ef", "ae81ff", "a1efe4")
+Themes.rosepine = mk("191724", "1f1d2e", "26233a", "e0def4", "6e6a86", "eb6f92", "9ccfd8", "f6c177", "3e8fb0", "c4a7e7", "ebbcba")
+Themes.everforest = mk("2d353b", "232a2e", "3d484d", "d3c6aa", "859289", "e67e80", "a7c080", "dbbc7f", "7fbbb3", "d699b6", "83c092")
+Themes.kanagawa = mk("1f1f28", "16161d", "2a2a37", "dcd7ba", "727169", "c34043", "98bb6c", "e6c384", "7e9cd8", "957fb8", "7aa89f")
+Themes["github-dark"] = mk("0d1117", "161b22", "30363d", "c9d1d9", "8b949e", "ff7b72", "7ee787", "e3b341", "79c0ff", "d2a8ff", "a5d6ff", 0.02)
+Themes.matrix = mk("000000", "050a05", "0b3d14", "00ff41", "008f23", "ff3b3b", "00ff41", "d6ff3b", "3bff9d", "9dff3b", "3bffe0", 0.05)
+
+-- short names for the most popular variants
+local ThemeAliases = {
+	catppuccin = "catppuccin-mocha", mocha = "catppuccin-mocha", macchiato = "catppuccin-macchiato",
+	frappe = "catppuccin-frappe", latte = "catppuccin-latte",
+	tokyonight = "tokyonight-night", tokyo = "tokyonight-night", ["tokyo-night"] = "tokyonight-night",
+	solarized = "solarized-dark", ["one-dark"] = "onedark", ["rose-pine"] = "rosepine",
+	github = "github-dark",
+}
+
 local function resolveTheme(t)
 	local base = Themes.default
 	local out = { palette = {} }
 	for k, v in pairs(base) do if k ~= "palette" then out[k] = v end end
 	for k, v in pairs(base.palette) do out.palette[k] = v end
-	if type(t) == "string" then t = Themes[t] or Themes.default end
+	if type(t) == "string" then t = Themes[ThemeAliases[t] or t] or Themes.default end
 	if type(t) == "table" then
 		for k, v in pairs(t) do
 			if k == "palette" then
@@ -542,6 +589,7 @@ end
 local Terminal = {}
 Terminal.__index = Terminal
 Terminal.Themes = Themes
+Terminal.ThemeAliases = ThemeAliases
 Terminal.FS = FS
 Terminal.Escape = esc
 Terminal.Version = "1.0"
@@ -573,7 +621,7 @@ function Terminal.new(config)
 	local self = setmetatable({}, Terminal)
 	self.Config = cfg
 	self.Theme = resolveTheme(cfg.Theme)
-	self.ThemeName = type(cfg.Theme) == "string" and cfg.Theme or "custom"
+	self.ThemeName = type(cfg.Theme) == "string" and (ThemeAliases[cfg.Theme] or cfg.Theme) or "custom"
 	self.Visible = false
 	self.Destroyed = false
 
@@ -981,7 +1029,7 @@ end
 
 function Terminal:SetTheme(t)
 	self.Theme = resolveTheme(t)
-	self.ThemeName = type(t) == "string" and t or "custom"
+	self.ThemeName = type(t) == "string" and (ThemeAliases[t] or t) or "custom"
 	local th, ui = self.Theme, self._ui
 	ui.window.BackgroundColor3 = th.bg
 	ui.window.BackgroundTransparency = th.bgTransparency
@@ -3862,7 +3910,10 @@ function Terminal:_installBuiltins()
 			end
 			return 0
 		end
-		if not Themes[name] then ctx.error("theme: unknown theme '" .. name .. "'") return 1 end
+		if not Themes[ThemeAliases[name] or name] then
+			ctx.error("theme: unknown theme '" .. name .. "' (run 'theme' to list them)")
+			return 1
+		end
 		term:SetTheme(name)
 		return 0
 	end })

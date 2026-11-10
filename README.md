@@ -234,7 +234,28 @@ Pass a table to `Terminal.new`. All fields are optional.
 
 ### Themes
 
-Built in: `default`, `ubuntu`, `dracula`, `gruvbox`. Switch at runtime with `theme dracula` or `term:SetTheme("dracula")`.
+Switch at runtime with `theme <name>` (run `theme` alone to list them) or `term:SetTheme("name")`. You can also pass a name as the `Theme` option.
+
+| Theme | Short names |
+| --- | --- |
+| `default`, `ubuntu`, `dracula`, `gruvbox` | |
+| `catppuccin-mocha` | `catppuccin`, `mocha` |
+| `catppuccin-macchiato` | `macchiato` |
+| `catppuccin-frappe` | `frappe` |
+| `catppuccin-latte` (light) | `latte` |
+| `tokyonight-night` | `tokyonight`, `tokyo`, `tokyo-night` |
+| `tokyonight-storm` | |
+| `tokyonight-day` (light) | |
+| `nord` | |
+| `solarized-dark` | `solarized` |
+| `solarized-light` (light) | |
+| `onedark` | `one-dark` |
+| `monokai` | |
+| `rosepine` | `rose-pine` |
+| `everforest` | |
+| `kanagawa` | |
+| `github-dark` | `github` |
+| `matrix` | |
 
 A custom theme overrides any subset of the default:
 
