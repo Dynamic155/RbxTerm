@@ -99,6 +99,116 @@ Not supported: globbing (`*`), background jobs (`&`), subshells, command substit
 
 Every command that defines a `usage` string also answers to `--help`.
 
+### More tools
+
+| Command | Description |
+| --- | --- |
+| `vim [file]`, `vi [file]` | Modal editor, see [Editors](#editors) |
+| `nano [file]` | Friendly editor with Ctrl shortcuts, see [Editors](#editors) |
+| `less [file]`, `more [file]` | Full-screen pager. Works on pipes: `ls \| less` |
+| `man cmd` | Show a command's help page in the pager |
+| `cp [-r] src... dest`, `mv src... dest` | Copy and move files |
+| `chmod +x\|-x\|755\|644 file...` | Set or clear the executable bit |
+| `stat file...` | File details |
+| `basename path`, `dirname path` | Path pieces |
+| `find [path] [-name glob] [-type f\|d]` | Search the filesystem |
+| `sort [-r] [-n] [-u]`, `uniq [-c]` | Sort lines, collapse duplicates |
+| `cut -d DELIM -f FIELDS` | Pick fields, e.g. `-f 1,3` or `-f 2-4` |
+| `tr SET1 SET2`, `tr -d SET` | Translate or delete characters from stdin |
+| `sed 's/old/new/g'` | Plain-text substitution (not regex) |
+| `tee [-a] file...` | Copy stdin to files and the screen |
+| `seq [first [step]] last` | Number sequence |
+| `diff a b` | Line diff (`<` removed, `>` added) |
+| `curl [-o file] url` | Fetch a URL with `game:HttpGet` |
+| `wget [-O file] url` | Download a URL into a file |
+| `alias name='cmd'`, `unalias name` | Shell aliases. `ll`, `la` and `l` exist by default |
+| `sh script`, `bash script`, `source script` | Run a file of shell commands |
+| `true`, `false` | Exit statuses for `&&` and `\|\|` |
+| `uptime`, `free` | Session uptime, Lua heap usage |
+
+Files whose first line is a shell shebang (`#!/bin/sh`, `#!/bin/bash`) run as shell scripts when executed. Files with any other shebang (such as `#!lua`) run as Lua.
+
+## Editors
+
+`vim` and `nano` take over the window body with a character grid. They read and write the virtual filesystem, show line and column in the status line, and highlight Lua files (`.lua`). Files are treated as ASCII: tabs become four spaces on load.
+
+Keyboard notes:
+- Roblox opens its own menu when you press Escape. In vim, use `Ctrl+[` or `Ctrl+C` to leave insert mode. Plain Escape still works but may also open the Roblox menu.
+- If your toggle key is a Ctrl key, it is ignored while an editor is open so Ctrl shortcuts do not hide the terminal.
+- Pasting works with your normal paste shortcut.
+
+### vim
+
+| Area | Keys |
+| --- | --- |
+| Modes | `i a I A o O` enter insert, `Esc` / `Ctrl+[` / `Ctrl+C` return to normal, `v` visual, `V` visual line |
+| Move | `h j k l`, arrows, `w b e`, `0 ^ $`, `gg G` (`5G` goes to line 5), `f t F T` + char, `{ }`, `Ctrl+F/B/D/U`, counts like `5j` |
+| Edit | `x X D C s S r J ~ p P u` and `Ctrl+R` redo |
+| Operators | `d y c` combined with motions or doubled: `dw d$ dd 3dd yy yw cw cc dgg dG` |
+| Visual | move, then `d`, `y`, `c` or `x` |
+| Search | `/text`, `n`, `N`, `?text` (plain text, wraps around) |
+| Command line | `:w [file]`, `:q`, `:q!`, `:wq`, `:x`, `:e file`, `:set nu` / `:set nonu`, `:42`, `:$`, `:s/a/b/[g]`, `:%s/a/b/[g]`, `:help` |
+
+Not implemented: `.` repeat, macros, named registers, text objects (`diw`), splits and tabs, regex search.
+
+### nano
+
+| Keys | Action |
+| --- | --- |
+| `Ctrl+O` | Write out (asks for a file name) |
+| `Ctrl+X` | Exit, asking to save if modified |
+| `Ctrl+K` / `Ctrl+U` | Cut line (repeat to collect more lines) / paste |
+| `Ctrl+W` | Search |
+| `Ctrl+_` or `Ctrl+T` | Go to line |
+| `Ctrl+C` | Show cursor position |
+| `Ctrl+G` | Short help |
+| `Ctrl+A` / `Ctrl+E` | Start / end of line |
+| `Ctrl+Y`, `PageUp`, `PageDown` | Page up / down |
+| `Alt+U`, `Alt+E`, `Ctrl+Z` | Undo, redo, undo |
+| Arrows, Home, End, Backspace, Delete, Tab | As expected |
+
+`Ctrl+V` is left to paste.
+
+### Pager
+
+`less`, `more` and `man` use one pager: `j`/`k` or arrows scroll, `Space`/`b` page, `d`/`u` half page, `g`/`G` top and bottom, `/text` search, `n`/`N` next and previous match, `q` quits.
+
+## Full-screen apps API
+
+You can build your own full-screen programs on the same layer vim and nano use.
+
+```lua
+term:RegisterCommand("hello-screen", function(ctx)
+    local screen
+    local function draw()
+        local rows = {}
+        rows[1] = { t = "<b>Full-screen demo</b>", style = "bar" }
+        rows[3] = "Press q to quit. Size: " .. screen.cols .. "x" .. screen.rows
+        screen:Render(rows, { row = 3, col = 1, style = "block" })
+    end
+    screen = term:OpenScreen({
+        onKey = function(key) if key.ctrl and key.name == "c" then screen:Close() end end,
+        onChar = function(text) if text == "q" then screen:Close() else draw() end end,
+        onResize = draw,
+    })
+    draw()
+    screen:Wait()   -- yields this command until the screen closes
+end)
+```
+
+| Member | Description |
+| --- | --- |
+| `term:OpenScreen(handlers)` | Open the grid. Only one screen can be open at a time |
+| `handlers.onKey(key)` | Special keys, and letters held with Ctrl or Alt. `key = { name, ctrl, alt, shift }` where `name` is `Up`, `Down`, `Left`, `Right`, `Enter`, `Backspace`, `Delete`, `Tab`, `Escape`, `Home`, `End`, `PageUp`, `PageDown` or a lowercase letter |
+| `handlers.onChar(text)` | Typed or pasted text |
+| `handlers.onResize(screen)` | Called when the window changes size |
+| `screen.rows`, `screen.cols` | Grid size in characters |
+| `screen:Render(rows, cursor)` | `rows[i]` is rich text markup or `{ t = markup, style = "bar" }`. `cursor` is `{ row, col, style = "block" or "bar" }` or nil |
+| `screen:Wait()` | Yield until the screen closes |
+| `screen:Close()` | Close it and return to the shell |
+
+Remember to escape user text with `Terminal.Escape(text)` before putting it in markup.
+
 ## Configuration
 
 Pass a table to `Terminal.new`. All fields are optional.
@@ -303,6 +413,7 @@ The filesystem lives in memory only. It resets each time the script runs.
 
 ## Notes and limitations
 
+- The editors have not been tested against every executor. If key input misbehaves, check that your executor delivers keyboard events to a focused `TextBox`.
 - Only one command runs at a time. Ctrl+C interrupts commands that use `ctx.sleep`, `ctx.read` or check `ctx.cancelled()`. A plain `task.wait` loop inside a script cannot be interrupted.
 - Pipes buffer the whole output of a stage before the next stage starts.
 - `grep` matches plain text, not patterns.
@@ -312,7 +423,8 @@ The filesystem lives in memory only. It resets each time the script runs.
 
 ## Roadmap ideas
 
-- `cp`, `mv`, `chmod`, globbing, and `alias`
+- Globbing, `ln`, `xargs`, `top` and `ps`
 - Background jobs and a process table
+- Vim dot repeat, text objects and regex search
 - Persisting the filesystem with `writefile` and `readfile`
 - A small package manager that installs scripts from URLs into `/usr/local/bin`

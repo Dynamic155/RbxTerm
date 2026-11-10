@@ -25,6 +25,7 @@ local TweenService = game:GetService("TweenService")
 local Lighting = game:GetService("Lighting")
 local LogService = game:GetService("LogService")
 local CoreGui = game:GetService("CoreGui")
+local TextService = game:GetService("TextService")
 
 local BASE_ENV = (getfenv and getfenv()) or _G
 local unpack = table.unpack or unpack
@@ -303,6 +304,38 @@ function FS:Remove(path, recursive)
 	return true
 end
 
+local function cloneNode(node)
+	if node.type == "dir" then
+		local d = newDir()
+		for n, c in pairs(node.children) do d.children[n] = cloneNode(c) end
+		return d
+	end
+	local f = {}
+	for k, v in pairs(node) do f[k] = v end
+	f.mtime = os.time()
+	return f
+end
+
+function FS:Copy(src, dst)
+	local node = self:Get(src)
+	if not node then return false, "No such file or directory" end
+	local s, d = self:Resolve(src, "/"), self:Resolve(dst, "/")
+	if d == s or d:sub(1, #s + 1) == s .. "/" then return false, "cannot copy a file into itself" end
+	local dir, name = self:_split(dst)
+	if not name then return false, "Invalid destination" end
+	local parent = self:Get(dir)
+	if not parent or parent.type ~= "dir" then return false, "No such file or directory" end
+	parent.children[name] = cloneNode(node)
+	return true
+end
+
+function FS:Move(src, dst)
+	local ok, err = self:Copy(src, dst)
+	if not ok then return false, err end
+	self:Remove(src, true)
+	return true
+end
+
 function FS:List(path, hidden)
 	local node = self:Get(path)
 	if not node then return nil, "No such file or directory" end
@@ -320,8 +353,9 @@ function FS:List(path, hidden)
 end
 
 local function isExec(node)
-	return node.type == "file" and (node.run ~= nil or node.command ~= nil or node.executable == true
-		or (node.content ~= nil and node.content:sub(1, 2) == "#!"))
+	if node.type ~= "file" or node.executable == false then return false end
+	return node.run ~= nil or node.command ~= nil or node.executable == true
+		or (node.content ~= nil and node.content:sub(1, 2) == "#!")
 end
 
 ------------------------------------------------------------------------------
@@ -555,6 +589,7 @@ function Terminal.new(config)
 		LANG = "en_US.UTF-8",
 	}
 	self.commands = {}
+	self.aliases = { ll = "ls -l", la = "ls -a", l = "ls" }
 	self.history = {}
 	self.lastStatus = 0
 	self.startTime = os.clock()
@@ -567,6 +602,7 @@ function Terminal.new(config)
 	self:_buildFS()
 	self:_buildUI()
 	self:_installBuiltins()
+	self:_installTools()
 	self:_refreshPrompt()
 
 	if cfg.Motd then
@@ -812,11 +848,12 @@ function Terminal:_buildUI()
 
 	conn(UserInputService.InputBegan:Connect(function(inp, processed)
 		local kc = inp.KeyCode
-		if kc == cfg.ToggleKey and (self.Visible or not processed) then
+		local isCtrlKey = kc == Enum.KeyCode.LeftControl or kc == Enum.KeyCode.RightControl
+		if kc == cfg.ToggleKey and (self.Visible or not processed) and not (self._screen and isCtrlKey) then
 			self:Toggle()
 			return
 		end
-		if not self.Visible then return end
+		if not self.Visible or self._screen then return end
 		local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
 		if self._busy and ctrl and kc == Enum.KeyCode.C then
 			self:Interrupt()
@@ -1107,7 +1144,12 @@ function Terminal:Show()
 	self._window.Position = self._basePos + UDim2.fromOffset(0, 16)
 	tween(self._window, 0.3, { GroupTransparency = 0, Position = self._basePos })
 	task.delay(0.05, function()
-		if self.Visible and self._row.Visible then self._input:CaptureFocus() end
+		if not self.Visible then return end
+		if self._screen then
+			self._screen.box:CaptureFocus()
+		elseif self._row.Visible then
+			self._input:CaptureFocus()
+		end
 	end)
 end
 
@@ -1115,6 +1157,7 @@ function Terminal:Hide()
 	if not self.Visible or self.Destroyed then return end
 	self.Visible = false
 	self._input:ReleaseFocus()
+	if self._screen then self._screen.box:ReleaseFocus() end
 	if self._blur then tween(self._blur, 0.25, { Size = 0 }) end
 	tween(self._overlay, 0.25, { BackgroundTransparency = 1 })
 	tween(self._window, 0.25, { GroupTransparency = 1, Position = self._basePos + UDim2.fromOffset(0, 16) })
@@ -1135,6 +1178,7 @@ function Terminal:Destroy()
 	self.Destroyed = true
 	self.Visible = false
 	self:MirrorConsole(false)
+	if self._screen then self._screen:Close() end
 	for _, c in ipairs(self._conns) do c:Disconnect() end
 	if self._reader then
 		local r = self._reader
@@ -1201,6 +1245,7 @@ end
 
 function Terminal:Interrupt()
 	if not self._busy then return end
+	if self._screen then self._screen:Close() end
 	self._interrupt = true
 	self:_write("^C\n")
 	if self._reader then
@@ -1226,7 +1271,15 @@ function Terminal:_expandWord(tok)
 end
 
 function Terminal:_execLine(line)
-	local first, rest = line:match("^%s*(%S+)%s*(.*)$")
+	local first, rest
+	for _ = 1, 5 do
+		first, rest = line:match("^%s*(%S+)%s*(.*)$")
+		if first and self.aliases[first] then
+			line = self.aliases[first] .. (rest ~= "" and (" " .. rest) or "")
+		else
+			break
+		end
+	end
 	if not first then return end
 
 	-- "raw" commands (lua) receive the rest of the line verbatim
@@ -1314,7 +1367,11 @@ function Terminal:_runCommand(argv, stdin, out, raw)
 	end
 	local ok, res = pcall(function()
 		if target.run then return target.run(ctx) end
-		if target.content then return self:_runLua(target.content:gsub("^#![^\n]*", ""), name, ctx) end
+		if target.content then
+			local shebang = target.content:match("^#![^\n]*")
+			if shebang and shebang:match("sh%s*$") then return self:_runShell(target.content, ctx) end
+			return self:_runLua((target.content:gsub("^#![^\n]*", "")), name, ctx)
+		end
 		return 0
 	end)
 	if not ok then
@@ -1520,6 +1577,1992 @@ end
 function Terminal:UnregisterCommand(name)
 	self.commands[name] = nil
 	self.fs:Remove("/bin/" .. name)
+end
+
+------------------------------------------------------- full-screen apps ----
+
+local KEYNAMES = {
+	[Enum.KeyCode.Up] = "Up", [Enum.KeyCode.Down] = "Down", [Enum.KeyCode.Left] = "Left", [Enum.KeyCode.Right] = "Right",
+	[Enum.KeyCode.Return] = "Enter", [Enum.KeyCode.KeypadEnter] = "Enter", [Enum.KeyCode.Backspace] = "Backspace",
+	[Enum.KeyCode.Delete] = "Delete", [Enum.KeyCode.Tab] = "Tab", [Enum.KeyCode.Escape] = "Escape",
+	[Enum.KeyCode.Home] = "Home", [Enum.KeyCode.End] = "End", [Enum.KeyCode.PageUp] = "PageUp",
+	[Enum.KeyCode.PageDown] = "PageDown",
+}
+local REPEATABLE = { Up = true, Down = true, Left = true, Right = true, Backspace = true, Delete = true,
+	PageUp = true, PageDown = true, Enter = true }
+
+--[[
+    term:OpenScreen({ onKey, onChar, onResize, onClose }) -> screen
+
+    Takes over the window body with a character grid (used by vim, nano, less).
+      onKey(key)   key = { name = "Up"|"Enter"|"Escape"|"a"..., ctrl = bool, alt = bool, shift = bool }
+                   (letters only arrive here when Ctrl or Alt is held; plain typing goes to onChar)
+      onChar(text) typed or pasted text
+    screen.rows / screen.cols    size of the grid
+    screen:Render(rows, cursor)  rows[i] = markup string or { t = markup, style = "bar" }
+                                 cursor = { row, col, style = "block"|"bar" } or nil
+    screen:Wait()                yield the calling command until the screen closes
+    screen:Close()
+]]
+function Terminal:OpenScreen(opts)
+	assert(not self._screen, "a full-screen app is already open")
+	local term, cfg = self, self.Config
+	local screen = { term = self, closed = false, rows = 1, cols = 1 }
+	local conns = {}
+	local function conn(c) conns[#conns + 1] = c end
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Screen"
+	frame.Position = UDim2.fromOffset(0, self._HEADER)
+	frame.Size = UDim2.new(1, 0, 1, -self._HEADER)
+	frame.BackgroundTransparency = 1
+	frame.BorderSizePixel = 0
+	frame.ClipsDescendants = true
+	frame.Active = true
+	frame.ZIndex = 3
+	frame.Parent = self._window
+	self._ui.scroll.Visible = false
+
+	local lineH = cfg.TextSize + 4
+	local charW = TextService:GetTextSize(string.rep("M", 32), cfg.TextSize, cfg.Font, Vector2.new(10000, 10000)).X / 32
+	local padX, padY = 12, 6
+	screen.lineH, screen.charW = lineH, charW
+
+	local box = Instance.new("TextBox")
+	box.Name = "Capture"
+	box.Size = UDim2.fromOffset(4, 4)
+	box.BackgroundTransparency = 1
+	box.TextTransparency = 1
+	box.ClearTextOnFocus = false
+	box.MultiLine = false
+	box.Text = ""
+	box.ZIndex = 1
+	box.Parent = frame
+	screen.box = box
+
+	local cursor = Instance.new("Frame")
+	cursor.BorderSizePixel = 0
+	cursor.BackgroundColor3 = self.Theme.text
+	cursor.BackgroundTransparency = 0.55
+	cursor.ZIndex = 5
+	cursor.Visible = false
+	cursor.Parent = frame
+
+	local labels, cache = {}, {}
+	local function relayout()
+		local sz = self._window.AbsoluteSize
+		screen.rows = math.max(1, math.floor((sz.Y - self._HEADER - padY * 2) / lineH))
+		screen.cols = math.max(1, math.floor((sz.X - padX * 2) / charW))
+		for i = #labels + 1, screen.rows do
+			local l = Instance.new("TextLabel")
+			l.BackgroundTransparency = 1
+			l.Size = UDim2.new(1, 0, 0, lineH)
+			l.Position = UDim2.fromOffset(0, padY + (i - 1) * lineH)
+			l.RichText = true
+			l.TextWrapped = false
+			l.TextXAlignment = Enum.TextXAlignment.Left
+			l.Font = cfg.Font
+			l.TextSize = cfg.TextSize
+			l.TextColor3 = self.Theme.text
+			l.ClipsDescendants = true
+			l.ZIndex = 2
+			l.Text = ""
+			Instance.new("UIPadding", l).PaddingLeft = UDim.new(0, padX)
+			l.Parent = frame
+			labels[i] = l
+		end
+		for i, l in ipairs(labels) do l.Visible = i <= screen.rows end
+	end
+	relayout()
+
+	function screen:Render(rows, cur)
+		if self.closed then return end
+		for i = 1, self.rows do
+			local r = rows[i]
+			local text, style = "", nil
+			if type(r) == "table" then text, style = r.t or "", r.style elseif r then text = r end
+			local key = (style or "") .. "|" .. text
+			if cache[i] ~= key then
+				cache[i] = key
+				local l = labels[i]
+				l.Text = text
+				if style == "bar" then
+					l.BackgroundTransparency = 0
+					l.BackgroundColor3 = term.Theme.header
+				else
+					l.BackgroundTransparency = 1
+				end
+			end
+		end
+		if cur then
+			cursor.Visible = true
+			cursor.BackgroundColor3 = term.Theme.text
+			cursor.Size = UDim2.fromOffset(cur.style == "bar" and 2 or charW, lineH - 2)
+			cursor.Position = UDim2.fromOffset(padX + (cur.col - 1) * charW, padY + (cur.row - 1) * lineH + 1)
+		else
+			cursor.Visible = false
+		end
+	end
+
+	local function ctrlDown() return UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) end
+	local function altDown() return UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt) end
+	local function shiftDown() return UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift) end
+	local function fireKey(key)
+		if not screen.closed and opts.onKey then opts.onKey(key) end
+	end
+
+	conn(UserInputService.InputBegan:Connect(function(inp)
+		if screen.closed or not term.Visible then return end
+		if inp.UserInputType ~= Enum.UserInputType.Keyboard then return end
+		local kc = inp.KeyCode
+		local name = KEYNAMES[kc]
+		local ctrl, alt = ctrlDown(), altDown()
+		if not name and (ctrl or alt) then
+			if kc == Enum.KeyCode.LeftBracket and ctrl then
+				name, ctrl = "Escape", false
+			elseif kc == Enum.KeyCode.Minus and ctrl then
+				name = "_"
+			elseif #kc.Name == 1 then
+				name = kc.Name:lower()
+			end
+		end
+		if not name then return end
+		local key = { name = name, ctrl = ctrl, alt = alt, shift = shiftDown() }
+		fireKey(key)
+		if REPEATABLE[name] and not ctrl then
+			local token = {}
+			screen._rep = token
+			task.spawn(function()
+				task.wait(0.4)
+				while screen._rep == token and not screen.closed and UserInputService:IsKeyDown(kc) do
+					fireKey(key)
+					task.wait(0.04)
+				end
+			end)
+		end
+	end))
+	conn(UserInputService.InputEnded:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.Keyboard then screen._rep = nil end
+	end))
+
+	conn(box:GetPropertyChangedSignal("Text"):Connect(function()
+		local t = box.Text
+		if t == "" then return end
+		box.Text = ""
+		if screen.closed then return end
+		if #t == 1 and ctrlDown() then return end
+		t = t:gsub("\t", "")
+		local buf = {}
+		local function flush()
+			if #buf > 0 then
+				local s = table.concat(buf)
+				buf = {}
+				if not screen.closed and opts.onChar then opts.onChar(s) end
+			end
+		end
+		local i = 1
+		while i <= #t do
+			local c = t:sub(i, i)
+			if c == "\r" or c == "\n" then
+				flush()
+				if c == "\r" and t:sub(i + 1, i + 1) == "\n" then i = i + 1 end
+				fireKey({ name = "Enter" })
+			else
+				buf[#buf + 1] = c
+			end
+			i = i + 1
+		end
+		flush()
+	end))
+	conn(box.FocusLost:Connect(function()
+		task.defer(function()
+			if not screen.closed and term.Visible and not term.Destroyed then box:CaptureFocus() end
+		end)
+	end))
+	conn(frame.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			task.defer(function() if not screen.closed and term.Visible then box:CaptureFocus() end end)
+		end
+	end))
+	conn(self._window:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		relayout()
+		if opts.onResize then opts.onResize(screen) end
+	end))
+
+	function screen:Close()
+		if self.closed then return end
+		self.closed = true
+		for _, c in ipairs(conns) do c:Disconnect() end
+		frame:Destroy()
+		if term._screen == self then term._screen = nil end
+		if not term.Destroyed then term._ui.scroll.Visible = true end
+		if opts.onClose then pcall(opts.onClose) end
+		if self._co then
+			local co = self._co
+			self._co = nil
+			task.spawn(co)
+		end
+	end
+	function screen:Wait()
+		if self.closed then return end
+		self._co = coroutine.running()
+		coroutine.yield()
+	end
+
+	self._screen = screen
+	if self.Visible then box:CaptureFocus() end
+	return screen
+end
+
+------------------------------------------------------------------ editors ----
+
+local function copyLines(t)
+	local c = {}
+	for i, v in ipairs(t) do c[i] = v end
+	return c
+end
+
+local function charClass(c)
+	if c == "" or c:match("%s") then return 0 end
+	if c:match("[%w_]") then return 1 end
+	return 2
+end
+
+local function nextWord(lines, y, x)
+	local line = lines[y]
+	local cls = charClass(line:sub(x, x))
+	if cls ~= 0 then
+		while x <= #line and charClass(line:sub(x, x)) == cls do x = x + 1 end
+	end
+	while true do
+		while x <= #line and charClass(line:sub(x, x)) == 0 do x = x + 1 end
+		if x <= #line then return y, x end
+		if y >= #lines then return y, #line + 1 end
+		y = y + 1
+		line = lines[y]
+		x = 1
+		if line == "" then return y, 1 end
+	end
+end
+
+local function prevWord(lines, y, x)
+	x = x - 1
+	while true do
+		local line = lines[y]
+		while x >= 1 and charClass(line:sub(x, x)) == 0 do x = x - 1 end
+		if x >= 1 then
+			local cls = charClass(line:sub(x, x))
+			while x > 1 and charClass(line:sub(x - 1, x - 1)) == cls do x = x - 1 end
+			return y, x
+		end
+		if y == 1 then return 1, 1 end
+		y = y - 1
+		x = #lines[y]
+		if x == 0 then return y, 1 end
+	end
+end
+
+local function wordEnd(lines, y, x)
+	x = x + 1
+	while true do
+		local line = lines[y]
+		while x <= #line and charClass(line:sub(x, x)) == 0 do x = x + 1 end
+		if x <= #line then
+			local cls = charClass(line:sub(x, x))
+			while x < #line and charClass(line:sub(x + 1, x + 1)) == cls do x = x + 1 end
+			return y, x
+		end
+		if y >= #lines then return y, math.max(#line, 1) end
+		y = y + 1
+		x = 1
+	end
+end
+
+local LUA_KW = {}
+for w in ("and break do else elseif end false for function goto if in local nil not or repeat return then true until while continue"):gmatch("%a+") do
+	LUA_KW[w] = true
+end
+
+-- returns a table mapping column -> palette color name for a line of Lua
+local function luaColors(line)
+	local cols = {}
+	local i, n = 1, #line
+	while i <= n do
+		local c = line:sub(i, i)
+		if c == "-" and line:sub(i, i + 1) == "--" then
+			for j = i, n do cols[j] = "gray" end
+			break
+		elseif c == '"' or c == "'" then
+			local j = i + 1
+			while j <= n do
+				local d = line:sub(j, j)
+				if d == "\\" then j = j + 2 elseif d == c then break else j = j + 1 end
+			end
+			for k = i, math.min(j, n) do cols[k] = "green" end
+			i = j + 1
+		elseif c:match("%d") and not line:sub(i - 1, i - 1):match("[%w_]") then
+			local j = i
+			while line:sub(j, j):match("[%w%.]") do j = j + 1 end
+			for k = i, j - 1 do cols[k] = "yellow" end
+			i = j
+		elseif c:match("[%a_]") then
+			local w = line:match("^[%a_][%w_]*", i)
+			if LUA_KW[w] then
+				for k = i, i + #w - 1 do cols[k] = "magenta" end
+			end
+			i = i + #w
+		else
+			i = i + 1
+		end
+	end
+	return cols
+end
+
+-- markup for characters [from, to] of a line, with optional syntax colors and selection [s1, s2]
+local function lineMarkup(term, line, from, to, colors, s1, s2)
+	to = math.min(to, #line)
+	if to < from then return "" end
+	local out, runText = {}, {}
+	local runCol, runSel = nil, false
+	local function flush()
+		if #runText == 0 then return end
+		local s = esc(table.concat(runText))
+		if runCol then s = '<font color="' .. hex(term:_color(runCol)) .. '">' .. s .. "</font>" end
+		if runSel then s = '<mark color="' .. hex(term.Theme.dim) .. '" transparency="0.45">' .. s .. "</mark>" end
+		out[#out + 1] = s
+		runText = {}
+	end
+	for i = from, to do
+		local col = colors and colors[i] or nil
+		local sel = s1 ~= nil and i >= s1 and i <= s2
+		if col ~= runCol or sel ~= runSel then
+			flush()
+			runCol, runSel = col, sel
+		end
+		runText[#runText + 1] = line:sub(i, i)
+	end
+	flush()
+	return table.concat(out)
+end
+
+local function inv(term, text)
+	local th = term.Theme
+	return '<mark color="' .. hex(th.text) .. '" transparency="0"><font color="' .. hex(th.bg) .. '">' .. esc(text) .. "</font></mark>"
+end
+
+local Editor = {}
+Editor.__index = Editor
+
+function Editor.new(term, ctx, path)
+	local self = setmetatable({}, Editor)
+	self.term, self.ctx, self.path = term, ctx, path
+	self.abs = path and ctx.resolve(path) or nil
+	self.lines = { "" }
+	self.cy, self.cx = 1, 1
+	self.top, self.left = 1, 0
+	self.modified, self.isNew = false, true
+	self.undo, self.redo = {}, {}
+	self.lua = path ~= nil and path:match("%.lua$") ~= nil
+	if self.abs then
+		local node = ctx.fs:Get(self.abs)
+		if node and node.type == "dir" then
+			self.err = "Is a directory"
+		elseif node then
+			local content = (node.content or ""):gsub("\r", ""):gsub("\t", "    ")
+			local ls = splitLines(content)
+			if #ls == 0 then ls = { "" } end
+			self.lines, self.isNew, self.bytes = ls, false, #content
+		end
+	end
+	return self
+end
+
+function Editor:snap()
+	self.undo[#self.undo + 1] = { lines = copyLines(self.lines), cy = self.cy, cx = self.cx }
+	if #self.undo > 200 then table.remove(self.undo, 1) end
+	self.redo = {}
+end
+
+function Editor:doUndo()
+	local s = table.remove(self.undo)
+	if not s then return false end
+	self.redo[#self.redo + 1] = { lines = copyLines(self.lines), cy = self.cy, cx = self.cx }
+	self.lines, self.cy, self.cx = s.lines, s.cy, s.cx
+	self.modified = true
+	return true
+end
+
+function Editor:doRedo()
+	local s = table.remove(self.redo)
+	if not s then return false end
+	self.undo[#self.undo + 1] = { lines = copyLines(self.lines), cy = self.cy, cx = self.cx }
+	self.lines, self.cy, self.cx = s.lines, s.cy, s.cx
+	self.modified = true
+	return true
+end
+
+function Editor:curLine() return self.lines[self.cy] end
+
+function Editor:clamp(insert)
+	self.cy = math.max(1, math.min(self.cy, #self.lines))
+	local n = #self.lines[self.cy]
+	self.cx = math.max(1, math.min(self.cx, insert and (n + 1) or math.max(1, n)))
+end
+
+function Editor:insertText(text)
+	local line = self.lines[self.cy]
+	self.lines[self.cy] = line:sub(1, self.cx - 1) .. text .. line:sub(self.cx)
+	self.cx = self.cx + #text
+	self.modified = true
+end
+
+function Editor:newline()
+	local line = self.lines[self.cy]
+	self.lines[self.cy] = line:sub(1, self.cx - 1)
+	table.insert(self.lines, self.cy + 1, line:sub(self.cx))
+	self.cy, self.cx = self.cy + 1, 1
+	self.modified = true
+end
+
+function Editor:backspace()
+	local line = self.lines[self.cy]
+	if self.cx > 1 then
+		self.lines[self.cy] = line:sub(1, self.cx - 2) .. line:sub(self.cx)
+		self.cx = self.cx - 1
+	elseif self.cy > 1 then
+		local prev = self.lines[self.cy - 1]
+		self.cx = #prev + 1
+		self.lines[self.cy - 1] = prev .. line
+		table.remove(self.lines, self.cy)
+		self.cy = self.cy - 1
+	end
+	self.modified = true
+end
+
+function Editor:delete()
+	local line = self.lines[self.cy]
+	if self.cx <= #line then
+		self.lines[self.cy] = line:sub(1, self.cx - 1) .. line:sub(self.cx + 1)
+	elseif self.cy < #self.lines then
+		self.lines[self.cy] = line .. self.lines[self.cy + 1]
+		table.remove(self.lines, self.cy + 1)
+	end
+	self.modified = true
+end
+
+-- text from (y1,x1) inclusive to (y2,x2) exclusive
+function Editor:getRange(y1, x1, y2, x2)
+	if y1 == y2 then return self.lines[y1]:sub(x1, x2 - 1) end
+	local out = { self.lines[y1]:sub(x1) }
+	for y = y1 + 1, y2 - 1 do out[#out + 1] = self.lines[y] end
+	out[#out + 1] = self.lines[y2]:sub(1, x2 - 1)
+	return table.concat(out, "\n")
+end
+
+function Editor:deleteRange(y1, x1, y2, x2)
+	local text = self:getRange(y1, x1, y2, x2)
+	self.lines[y1] = self.lines[y1]:sub(1, x1 - 1) .. self.lines[y2]:sub(x2)
+	for _ = y1 + 1, y2 do table.remove(self.lines, y1 + 1) end
+	self.cy, self.cx = y1, x1
+	self.modified = true
+	return text
+end
+
+-- insert possibly multi-line text at (y,x); returns the position just after it
+function Editor:insertBlock(text, y, x)
+	local parts = {}
+	for p in (text .. "\n"):gmatch("(.-)\n") do parts[#parts + 1] = p end
+	local line = self.lines[y]
+	local head, tail = line:sub(1, x - 1), line:sub(x)
+	self.modified = true
+	if #parts == 1 then
+		self.lines[y] = head .. parts[1] .. tail
+		return y, x + #parts[1]
+	end
+	self.lines[y] = head .. parts[1]
+	for i = 2, #parts - 1 do table.insert(self.lines, y + i - 1, parts[i]) end
+	table.insert(self.lines, y + #parts - 1, parts[#parts] .. tail)
+	return y + #parts - 1, #parts[#parts] + 1
+end
+
+function Editor:save(path)
+	local target = path and self.ctx.resolve(path) or self.abs
+	if not target then return false, "No file name" end
+	local text = (#self.lines == 1 and self.lines[1] == "") and "" or (table.concat(self.lines, "\n") .. "\n")
+	local node, err = self.ctx.fs:WriteFile(target, text, { parents = false })
+	if not node then return false, err end
+	self.abs = target
+	self.path = path or self.path
+	self.modified, self.isNew = false, false
+	if self.path then self.lua = self.path:match("%.lua$") ~= nil end
+	return true, #self.lines, #text
+end
+
+function Editor:scrollTo(rows, cols)
+	if self.cy < self.top then self.top = self.cy end
+	if self.cy > self.top + rows - 1 then self.top = self.cy - rows + 1 end
+	if self.cx - 1 < self.left then self.left = self.cx - 1 end
+	if self.cx - 1 > self.left + cols - 1 then self.left = self.cx - cols end
+	if self.left < 0 then self.left = 0 end
+	if self.top < 1 then self.top = 1 end
+end
+
+-- fills out[first .. first+count-1] with markup; returns the gutter width
+function Editor:renderBody(out, first, count, o)
+	local term = self.term
+	local gw = o.number and (#tostring(#self.lines) + 1) or 0
+	local cols = math.max(1, o.cols - gw)
+	self:scrollTo(count, cols)
+	for i = 1, count do
+		local y = self.top + i - 1
+		local line = self.lines[y]
+		local txt
+		if line then
+			local s1, s2
+			if o.sel then s1, s2 = o.sel(y, line) end
+			txt = lineMarkup(term, line, self.left + 1, self.left + cols, self.lua and luaColors(line) or nil, s1, s2)
+			if gw > 0 then
+				txt = '<font color="' .. hex(term.Theme.dim) .. '">' .. string.format("%" .. (gw - 1) .. "d ", y) .. "</font>" .. txt
+			end
+		else
+			txt = o.tilde and ('<font color="' .. hex(term.Theme.palette.blue) .. '">~</font>') or ""
+		end
+		out[first + i - 1] = txt
+	end
+	return gw
+end
+
+------------------------------------------------------------------------ vim --
+
+local Vim = {}
+Vim.__index = Vim
+
+function Vim.new(term, ctx, path)
+	local self = setmetatable({}, Vim)
+	self.term, self.ctx = term, ctx
+	self.ed = Editor.new(term, ctx, path)
+	self.mode, self.count, self.cmd, self.msg = "normal", "", "", ""
+	self.promptChar = ":"
+	self.number = false
+	local ed = self.ed
+	if path then
+		if ed.isNew then
+			self.msg = string.format('"%s" [New]', path)
+		else
+			self.msg = string.format('"%s" %dL, %dB', path, #ed.lines, ed.bytes or 0)
+		end
+	end
+	return self
+end
+
+function Vim:run()
+	local screen = self.term:OpenScreen({
+		onKey = function(k) self:onKey(k) end,
+		onChar = function(c) self:onChar(c) end,
+		onResize = function() self:render() end,
+	})
+	self.screen = screen
+	self:render()
+	screen:Wait()
+end
+
+function Vim:render()
+	local s = self.screen
+	if not s or s.closed then return end
+	local ed = self.ed
+	local rows = {}
+	local textRows = math.max(1, s.rows - 2)
+	local visual = self.mode == "visual" or self.mode == "vline"
+	local sel
+	if visual then
+		local ay, ax, by, bx = self.vy, self.vx, ed.cy, ed.cx
+		if ay > by or (ay == by and ax > bx) then ay, ax, by, bx = by, bx, ay, ax end
+		sel = function(y, line)
+			if y < ay or y > by then return nil end
+			if self.mode == "vline" then return 1, math.max(#line, 1) end
+			return (y == ay) and ax or 1, (y == by) and bx or math.max(#line, 1)
+		end
+	end
+	local gw = ed:renderBody(rows, 1, textRows, { number = self.number, sel = sel, tilde = true, cols = s.cols })
+
+	local total = #ed.lines
+	local pct
+	if total <= textRows then pct = "All"
+	elseif ed.top == 1 then pct = "Top"
+	elseif ed.top + textRows - 1 >= total then pct = "Bot"
+	else pct = math.floor((ed.top - 1) / (total - textRows) * 100) .. "%" end
+	local left = (ed.path or "[No Name]") .. (ed.modified and " [+]" or "")
+	local right = string.format("%d,%d   %s", ed.cy, ed.cx, pct)
+	rows[textRows + 1] = { t = esc(left) .. string.rep(" ", math.max(1, s.cols - #left - #right)) .. esc(right), style = "bar" }
+
+	local last = ""
+	if self.mode == "cmd" then last = esc(self.promptChar .. self.cmd)
+	elseif self.msg ~= "" then last = esc(self.msg)
+	elseif self.mode == "insert" then last = "<b>-- INSERT --</b>"
+	elseif self.mode == "visual" then last = "<b>-- VISUAL --</b>"
+	elseif self.mode == "vline" then last = "<b>-- VISUAL LINE --</b>" end
+	rows[textRows + 2] = last
+
+	local cur
+	if self.mode == "cmd" then
+		cur = { row = textRows + 2, col = #self.promptChar + #self.cmd + 1, style = "bar" }
+	else
+		cur = { row = ed.cy - ed.top + 1, col = gw + ed.cx - ed.left, style = self.mode == "insert" and "bar" or "block" }
+	end
+	s:Render(rows, cur)
+end
+
+function Vim:resetPending()
+	self.count, self.op, self.opCount, self.pending = "", nil, nil, nil
+end
+
+function Vim:startInsert()
+	self:resetPending()
+	self.mode = "insert"
+end
+
+function Vim:toNormal()
+	local ed = self.ed
+	if self.mode == "insert" then ed.cx = math.max(1, ed.cx - 1) end
+	self.mode = "normal"
+	self:resetPending()
+	ed:clamp(false)
+end
+
+function Vim:enterCmd(pc)
+	self:resetPending()
+	self.mode, self.promptChar, self.cmd = "cmd", pc, ""
+end
+
+function Vim:page(dir, frac)
+	local ed = self.ed
+	local step = math.max(1, math.floor(math.max(1, self.screen.rows - 2) * frac))
+	ed.cy = ed.cy + dir * step
+	ed.top = math.max(1, ed.top + dir * step)
+	ed:clamp(false)
+end
+
+function Vim:onKey(k)
+	local ed, name = self.ed, k.name
+	self.msg = ""
+	if self.mode == "cmd" then return self:cmdKey(k) end
+	if name == "Escape" or (k.ctrl and name == "c") then
+		self:toNormal()
+	elseif self.mode == "insert" then
+		local line = ed:curLine()
+		if name == "Enter" then ed:newline()
+		elseif name == "Backspace" then ed:backspace()
+		elseif name == "Delete" then ed:delete()
+		elseif name == "Tab" then ed:insertText("    ")
+		elseif name == "Left" then ed.cx = math.max(1, ed.cx - 1)
+		elseif name == "Right" then ed.cx = math.min(#line + 1, ed.cx + 1)
+		elseif name == "Up" then ed.cy = ed.cy - 1; ed:clamp(true)
+		elseif name == "Down" then ed.cy = ed.cy + 1; ed:clamp(true)
+		elseif name == "Home" then ed.cx = 1
+		elseif name == "End" then ed.cx = #line + 1
+		elseif name == "PageUp" then self:page(-1, 1); ed:clamp(true)
+		elseif name == "PageDown" then self:page(1, 1); ed:clamp(true)
+		end
+	else
+		local visual = self.mode ~= "normal"
+		if k.ctrl then
+			if name == "r" then
+				if not ed:doRedo() then self.msg = "Already at newest change" end
+				ed:clamp(false)
+			elseif name == "f" then self:page(1, 1)
+			elseif name == "b" then self:page(-1, 1)
+			elseif name == "d" then self:page(1, 0.5)
+			elseif name == "u" then self:page(-1, 0.5)
+			end
+		elseif name == "Left" or name == "Backspace" then self:normalChar("h")
+		elseif name == "Right" then self:normalChar("l")
+		elseif name == "Up" then self:normalChar("k")
+		elseif name == "Down" or name == "Enter" then self:normalChar("j")
+		elseif name == "Home" then self:normalChar("0")
+		elseif name == "End" then self:normalChar("$")
+		elseif name == "Delete" then self:normalChar("x")
+		elseif name == "PageUp" then self:page(-1, 1)
+		elseif name == "PageDown" then self:page(1, 1)
+		end
+		if visual and self.mode == "normal" then ed:clamp(false) end
+	end
+	self:render()
+end
+
+function Vim:onChar(text)
+	if not self.screen or self.screen.closed then return end
+	self.msg = ""
+	if self.mode == "cmd" then
+		self.cmd = self.cmd .. text
+	elseif self.mode == "insert" then
+		self.ed:insertText(text)
+	else
+		for i = 1, #text do
+			if self.screen.closed then return end
+			self:normalChar(text:sub(i, i))
+		end
+	end
+	self:render()
+end
+
+-- returns { y, x, linewise, inclusive, word } or nil
+function Vim:motion(key, n, hasCount, arg, op)
+	local ed = self.ed
+	local lines = ed.lines
+	local y, x = ed.cy, ed.cx
+	local line = lines[y]
+	if key == "h" then
+		return { y = y, x = math.max(1, x - n) }
+	elseif key == "l" then
+		return { y = y, x = math.min(x + n, op and (#line + 1) or math.max(#line, 1)) }
+	elseif key == "0" then
+		return { y = y, x = 1 }
+	elseif key == "^" then
+		return { y = y, x = line:find("%S") or 1 }
+	elseif key == "$" then
+		local ty = math.min(#lines, y + n - 1)
+		return { y = ty, x = math.max(#lines[ty], 1), inclusive = true }
+	elseif key == "j" then
+		return { y = math.min(#lines, y + n), x = x, linewise = true }
+	elseif key == "k" then
+		return { y = math.max(1, y - n), x = x, linewise = true }
+	elseif key == "G" then
+		local ty = hasCount and math.min(n, #lines) or #lines
+		return { y = ty, x = lines[ty]:find("%S") or 1, linewise = true }
+	elseif key == "gg" then
+		local ty = hasCount and math.min(n, #lines) or 1
+		return { y = ty, x = lines[ty]:find("%S") or 1, linewise = true }
+	elseif key == "w" then
+		if op == "c" and charClass(line:sub(x, x)) ~= 0 then
+			local ey, ex = y, x - 1
+			for _ = 1, n do ey, ex = wordEnd(lines, ey, ex) end
+			return { y = ey, x = ex, inclusive = true }
+		end
+		for _ = 1, n do y, x = nextWord(lines, y, x) end
+		return { y = y, x = x, word = true }
+	elseif key == "b" then
+		for _ = 1, n do y, x = prevWord(lines, y, x) end
+		return { y = y, x = x }
+	elseif key == "e" then
+		for _ = 1, n do y, x = wordEnd(lines, y, x) end
+		return { y = y, x = x, inclusive = true }
+	elseif key == "f" or key == "t" then
+		local idx = x
+		for _ = 1, n do
+			idx = line:find(arg, idx + 1, true)
+			if not idx then return nil end
+		end
+		return { y = y, x = key == "t" and idx - 1 or idx, inclusive = true }
+	elseif key == "F" or key == "T" then
+		local idx = x
+		for _ = 1, n do
+			local found
+			for i = idx - 1, 1, -1 do
+				if line:sub(i, i) == arg then found = i; break end
+			end
+			if not found then return nil end
+			idx = found
+		end
+		return { y = y, x = key == "T" and idx + 1 or idx }
+	elseif key == "}" then
+		local ty = y + 1
+		while ty < #lines and lines[ty] ~= "" do ty = ty + 1 end
+		return { y = math.min(ty, #lines), x = 1 }
+	elseif key == "{" then
+		local ty = y - 1
+		while ty > 1 and lines[ty] ~= "" do ty = ty - 1 end
+		return { y = math.max(ty, 1), x = 1 }
+	end
+	return nil
+end
+
+function Vim:applyRange(op, y1, x1, y2, x2)
+	local ed = self.ed
+	if y1 == y2 and x2 <= x1 then
+		if op == "c" then ed:snap(); self:startInsert() end
+		return
+	end
+	self.term._reg = { text = ed:getRange(y1, x1, y2, x2), linewise = false }
+	if op == "y" then
+		ed.cy, ed.cx = y1, x1
+		return
+	end
+	ed:snap()
+	ed:deleteRange(y1, x1, y2, x2)
+	if op == "c" then self:startInsert() else ed:clamp(false) end
+end
+
+function Vim:applyLinewise(op, y1, y2)
+	local ed = self.ed
+	local chunk = {}
+	for y = y1, y2 do chunk[#chunk + 1] = ed.lines[y] end
+	self.term._reg = { text = table.concat(chunk, "\n"), linewise = true }
+	if op == "y" then
+		ed.cy = y1
+		if #chunk > 2 then self.msg = #chunk .. " lines yanked" end
+		return
+	end
+	ed:snap()
+	for _ = y1, y2 do table.remove(ed.lines, y1) end
+	ed.modified = true
+	if op == "d" then
+		if #ed.lines == 0 then ed.lines = { "" } end
+		ed.cy = math.min(y1, #ed.lines)
+		ed.cx = ed.lines[ed.cy]:find("%S") or 1
+		if #chunk > 2 then self.msg = #chunk .. " fewer lines" end
+	else
+		table.insert(ed.lines, y1, "")
+		ed.cy, ed.cx = y1, 1
+		self:startInsert()
+	end
+end
+
+function Vim:applyOp(op, spec)
+	local ed = self.ed
+	if spec.linewise then
+		return self:applyLinewise(op, math.min(ed.cy, spec.y), math.max(ed.cy, spec.y))
+	end
+	local y1, x1, y2, x2 = ed.cy, ed.cx, spec.y, spec.x
+	if spec.word and y2 > y1 then y2, x2 = y1, #ed.lines[y1] + 1 end
+	if y2 < y1 or (y2 == y1 and x2 < x1) then y1, x1, y2, x2 = y2, x2, y1, x1 end
+	if spec.inclusive then x2 = x2 + 1 end
+	self:applyRange(op, y1, x1, y2, x2)
+end
+
+function Vim:visualOp(op)
+	local ed = self.ed
+	local y1, x1, y2, x2 = self.vy, self.vx, ed.cy, ed.cx
+	if y1 > y2 or (y1 == y2 and x1 > x2) then y1, x1, y2, x2 = y2, x2, y1, x1 end
+	local mode = self.mode
+	self.mode = "normal"
+	self:resetPending()
+	if mode == "vline" then
+		self:applyLinewise(op, y1, y2)
+	else
+		self:applyRange(op, y1, x1, y2, x2 + 1)
+	end
+end
+
+function Vim:paste(before, n)
+	local ed = self.ed
+	local reg = self.term._reg
+	if not reg or (reg.text == "" and not reg.linewise) then
+		self.msg = 'E353: Nothing in register "'
+		return
+	end
+	ed:snap()
+	for _ = 1, n do
+		if reg.linewise then
+			local at = before and ed.cy or ed.cy + 1
+			local i = 0
+			for p in (reg.text .. "\n"):gmatch("(.-)\n") do
+				table.insert(ed.lines, at + i, p)
+				i = i + 1
+			end
+			ed.cy = at
+			ed.cx = ed.lines[ed.cy]:find("%S") or 1
+			ed.modified = true
+		else
+			local x = before and ed.cx or ed.cx + 1
+			x = math.min(x, #ed:curLine() + 1)
+			local ey, ex = ed:insertBlock(reg.text, ed.cy, x)
+			ed.cy, ed.cx = ey, ex - 1
+		end
+	end
+	ed:clamp(false)
+end
+
+function Vim:search(pat, dir, keepDir)
+	local ed = self.ed
+	if pat == "" then return false end
+	self.searchPat = pat
+	if not keepDir then self.searchDir = dir end
+	local lines, total = ed.lines, #ed.lines
+	for i = 0, total do
+		local y = ((ed.cy - 1 + dir * i) % total) + 1
+		local line = lines[y]
+		if dir == 1 then
+			local idx = line:find(pat, (i == 0) and (ed.cx + 1) or 1, true)
+			if idx then ed.cy, ed.cx = y, idx; return true end
+		else
+			local limit = (i == 0) and (ed.cx - 1) or #line
+			local last, init = nil, 1
+			while true do
+				local idx = line:find(pat, init, true)
+				if not idx or idx > limit then break end
+				last, init = idx, idx + 1
+			end
+			if last then ed.cy, ed.cx = y, last; return true end
+		end
+	end
+	self.msg = "E486: Pattern not found: " .. pat
+	return false
+end
+
+function Vim:normalChar(ch)
+	local ed = self.ed
+	if self.screen.closed then return end
+	local visual = self.mode == "visual" or self.mode == "vline"
+	local p = self.pending
+	local key, arg = ch, nil
+	if p then
+		self.pending = nil
+		if p == "r" then
+			self.count = ""
+			local line = ed:curLine()
+			if not visual and ed.cx <= #line then
+				ed:snap()
+				ed.lines[ed.cy] = line:sub(1, ed.cx - 1) .. ch .. line:sub(ed.cx + 1)
+				ed.modified = true
+			end
+			return
+		elseif p == "g" then
+			key = "g" .. ch
+		else
+			key, arg = p, ch
+		end
+	else
+		if ch:match("%d") and (ch ~= "0" or self.count ~= "") then
+			self.count = self.count .. ch
+			return
+		end
+		if ch == "g" or ch == "f" or ch == "t" or ch == "F" or ch == "T" or (ch == "r" and not self.op) then
+			self.pending = ch
+			return
+		end
+	end
+	local n = tonumber(self.count)
+	local hasCount = n ~= nil
+	n = n or 1
+
+	if self.op and not visual then
+		local op = self.op
+		local total = (self.opCount or 1) * n
+		local opHas = hasCount or self.opCount ~= nil
+		self:resetPending()
+		if key == op then
+			self:applyLinewise(op, ed.cy, math.min(#ed.lines, ed.cy + total - 1))
+		else
+			local spec = self:motion(key, total, opHas, arg, op)
+			if spec then self:applyOp(op, spec) end
+		end
+		return
+	end
+
+	if key == "d" or key == "y" or key == "c" then
+		if visual then
+			self:visualOp(key)
+			return
+		end
+		self.op, self.opCount, self.count = key, (hasCount and n or nil), ""
+		return
+	end
+
+	local spec = self:motion(key, n, hasCount, arg, nil)
+	if spec then
+		self.count = ""
+		ed.cy, ed.cx = spec.y, spec.x
+		ed:clamp(false)
+		return
+	end
+	self.count = ""
+
+	if visual then
+		if key == "v" then
+			if self.mode == "visual" then self:toNormal() else self.mode = "visual" end
+		elseif key == "V" then
+			if self.mode == "vline" then self:toNormal() else self.mode = "vline" end
+		elseif key == "x" or key == "X" then
+			self:visualOp("d")
+		elseif key == "o" then
+			self.vy, ed.cy = ed.cy, self.vy
+			self.vx, ed.cx = ed.cx, self.vx
+		elseif key == ":" then
+			self:toNormal()
+			self:enterCmd(":")
+		end
+		return
+	end
+	self:normalCommand(key, n, hasCount)
+end
+
+function Vim:normalCommand(key, n, hasCount)
+	local ed = self.ed
+	local line = ed:curLine()
+	if key == "i" then
+		ed:snap(); self:startInsert()
+	elseif key == "a" then
+		ed:snap()
+		if #line > 0 then ed.cx = ed.cx + 1 end
+		self:startInsert()
+	elseif key == "I" then
+		ed:snap(); ed.cx = line:find("%S") or 1; self:startInsert()
+	elseif key == "A" then
+		ed:snap(); ed.cx = #line + 1; self:startInsert()
+	elseif key == "o" then
+		ed:snap()
+		table.insert(ed.lines, ed.cy + 1, "")
+		ed.cy, ed.cx, ed.modified = ed.cy + 1, 1, true
+		self:startInsert()
+	elseif key == "O" then
+		ed:snap()
+		table.insert(ed.lines, ed.cy, "")
+		ed.cx, ed.modified = 1, true
+		self:startInsert()
+	elseif key == "x" then
+		self:applyRange("d", ed.cy, ed.cx, ed.cy, math.min(ed.cx + n, #line + 1))
+	elseif key == "X" then
+		if ed.cx > 1 then self:applyRange("d", ed.cy, math.max(1, ed.cx - n), ed.cy, ed.cx) end
+	elseif key == "D" then
+		self:applyRange("d", ed.cy, ed.cx, ed.cy, #line + 1)
+	elseif key == "C" then
+		self:applyRange("c", ed.cy, ed.cx, ed.cy, #line + 1)
+	elseif key == "s" then
+		self:applyRange("c", ed.cy, ed.cx, ed.cy, math.min(ed.cx + n, #line + 1))
+	elseif key == "S" then
+		self:applyLinewise("c", ed.cy, math.min(#ed.lines, ed.cy + n - 1))
+	elseif key == "p" then
+		self:paste(false, n)
+	elseif key == "P" then
+		self:paste(true, n)
+	elseif key == "u" then
+		if ed:doUndo() then ed:clamp(false) else self.msg = "Already at oldest change" end
+	elseif key == "J" then
+		for _ = 1, math.max(1, hasCount and (n - 1) or 1) do
+			if ed.cy < #ed.lines then
+				ed:snap()
+				local a = ed.lines[ed.cy]
+				local b = ed.lines[ed.cy + 1]:gsub("^%s+", "")
+				ed.cx = #a + 1
+				ed.lines[ed.cy] = a .. ((#a > 0 and #b > 0) and " " or "") .. b
+				table.remove(ed.lines, ed.cy + 1)
+				ed.modified = true
+			end
+		end
+		ed:clamp(false)
+	elseif key == "~" then
+		if #line >= ed.cx then
+			ed:snap()
+			local c = line:sub(ed.cx, ed.cx)
+			local sw = (c:lower() == c) and c:upper() or c:lower()
+			ed.lines[ed.cy] = line:sub(1, ed.cx - 1) .. sw .. line:sub(ed.cx + 1)
+			ed.cx = math.min(ed.cx + 1, #line)
+			ed.modified = true
+		end
+	elseif key == "v" then
+		self.mode, self.vy, self.vx = "visual", ed.cy, ed.cx
+	elseif key == "V" then
+		self.mode, self.vy, self.vx = "vline", ed.cy, ed.cx
+	elseif key == ":" or key == "/" or key == "?" then
+		self:enterCmd(key)
+	elseif key == "n" then
+		if self.searchPat then self:search(self.searchPat, self.searchDir, true) else self.msg = "E35: No previous regular expression" end
+	elseif key == "N" then
+		if self.searchPat then self:search(self.searchPat, -self.searchDir, true) else self.msg = "E35: No previous regular expression" end
+	end
+end
+
+function Vim:cmdKey(k)
+	local name = k.name
+	if name == "Escape" or (k.ctrl and name == "c") then
+		self.mode, self.cmd = "normal", ""
+	elseif name == "Enter" then
+		local c, pc = self.cmd, self.promptChar
+		self.mode, self.cmd = "normal", ""
+		if pc == ":" then self:exCommand(c) else self:search(c, pc == "/" and 1 or -1) end
+	elseif name == "Backspace" then
+		if self.cmd == "" then self.mode = "normal" else self.cmd = self.cmd:sub(1, -2) end
+	end
+	self:render()
+end
+
+function Vim:write(path)
+	local ed = self.ed
+	local ok, a, b = ed:save(path)
+	if ok then
+		self.msg = string.format('"%s" %dL, %dB written', ed.path, a, b)
+	elseif a == "No file name" then
+		self.msg = "E32: No file name"
+	else
+		self.msg = "E212: Can't open file for writing"
+	end
+	return ok
+end
+
+function Vim:exCommand(c)
+	local ed = self.ed
+	c = c:gsub("^%s+", ""):gsub("%s+$", "")
+	if c == "" then return end
+	local num = tonumber(c)
+	if num then
+		ed.cy, ed.cx = math.max(1, math.min(num, #ed.lines)), 1
+		ed:clamp(false)
+		return
+	end
+	if c == "$" then
+		ed.cy, ed.cx = #ed.lines, 1
+		ed:clamp(false)
+		return
+	end
+
+	local range, rest = c:match("^(%%?)s/(.*)$")
+	if rest then
+		local pat, rep, flags = rest:match("^([^/]*)/([^/]*)/?(.*)$")
+		if not pat or pat == "" then self.msg = "E486: Pattern not found" return end
+		local y1, y2 = ed.cy, ed.cy
+		if range == "%" then y1, y2 = 1, #ed.lines end
+		ed:snap()
+		local count = 0
+		for y = y1, y2 do
+			local line = ed.lines[y]
+			local out, pos = {}, 1
+			while true do
+				local s, e = line:find(pat, pos, true)
+				if not s then break end
+				out[#out + 1] = line:sub(pos, s - 1) .. rep
+				pos = e + 1
+				count = count + 1
+				if not flags:find("g") then break end
+			end
+			out[#out + 1] = line:sub(pos)
+			ed.lines[y] = table.concat(out)
+		end
+		if count == 0 then
+			table.remove(ed.undo)
+			self.msg = "E486: Pattern not found: " .. pat
+		else
+			ed.modified = true
+			self.msg = count .. " substitutions"
+		end
+		return
+	end
+
+	local cmd, bang, arg = c:match("^(%a+)(!?)%s*(.*)$")
+	bang = bang == "!"
+	if cmd == "w" then
+		self:write(arg ~= "" and arg or nil)
+	elseif cmd == "wq" or cmd == "x" or cmd == "xit" then
+		if cmd == "wq" or ed.modified then
+			if not self:write(arg ~= "" and arg or nil) then return end
+		end
+		self.screen:Close()
+	elseif cmd == "q" or cmd == "quit" or cmd == "qa" or cmd == "qall" then
+		if ed.modified and not bang then
+			self.msg = "E37: No write since last change (add ! to override)"
+		else
+			self.screen:Close()
+		end
+	elseif cmd == "e" or cmd == "edit" then
+		if ed.modified and not bang then
+			self.msg = "E37: No write since last change (add ! to override)"
+		else
+			local target = arg ~= "" and arg or ed.path
+			if not target then self.msg = "E32: No file name" return end
+			local new = Editor.new(self.term, self.ctx, target)
+			if new.err then self.msg = "E502: \"" .. target .. "\" is a directory" return end
+			self.ed = new
+			self.msg = new.isNew and string.format('"%s" [New]', target) or string.format('"%s" %dL, %dB', target, #new.lines, new.bytes or 0)
+		end
+	elseif cmd == "set" then
+		for opt in arg:gmatch("%S+") do
+			if opt == "nu" or opt == "number" then self.number = true
+			elseif opt == "nonu" or opt == "nonumber" then self.number = false
+			elseif opt:match("^ts=") or opt:match("^sw=") or opt == "hlsearch" or opt == "ignorecase" then
+				-- accepted, no effect
+			else
+				self.msg = "E518: Unknown option: " .. opt
+			end
+		end
+	elseif cmd == "noh" or cmd == "nohlsearch" or cmd == "syntax" then
+		-- no-op
+	elseif cmd == "help" or cmd == "h" then
+		self.msg = "RbxTerm vim: :w save  :q quit  :wq save+quit  :set nu  :%s/a/b/g  /search  Esc or Ctrl+[ for normal mode"
+	else
+		self.msg = "E492: Not an editor command: " .. c
+	end
+end
+
+----------------------------------------------------------------------- nano --
+
+local Nano = {}
+Nano.__index = Nano
+
+function Nano.new(term, ctx, path)
+	local self = setmetatable({}, Nano)
+	self.term, self.ctx = term, ctx
+	self.ed = Editor.new(term, ctx, path)
+	self.msg = ""
+	if path then
+		if self.ed.isNew then self.msg = "[ New File ]" else self.msg = string.format("[ Read %d lines ]", #self.ed.lines) end
+	end
+	return self
+end
+
+function Nano:run()
+	local screen = self.term:OpenScreen({
+		onKey = function(k) self:onKey(k) end,
+		onChar = function(c) self:onChar(c) end,
+		onResize = function() self:render() end,
+	})
+	self.screen = screen
+	self:render()
+	screen:Wait()
+end
+
+local NANO_HELP1 = { { "^G", "Help" }, { "^O", "Write Out" }, { "^W", "Where Is" }, { "^K", "Cut" }, { "^C", "Location" } }
+local NANO_HELP2 = { { "^X", "Exit" }, { "^_", "Go To Line" }, { "^U", "Paste" }, { "M-U", "Undo" }, { "M-E", "Redo" } }
+
+function Nano:render()
+	local s = self.screen
+	if not s or s.closed then return end
+	local ed, term = self.ed, self.term
+	local rows = {}
+	local textRows = math.max(1, s.rows - 4)
+
+	local left = "  RbxTerm nano"
+	local center = ed.path or "New Buffer"
+	local right = ed.modified and "Modified  " or ""
+	local pad1 = math.max(1, math.floor((s.cols - #center) / 2) - #left)
+	local pad2 = math.max(1, s.cols - #left - pad1 - #center - #right)
+	rows[1] = { t = esc(left) .. string.rep(" ", pad1) .. esc(center) .. string.rep(" ", pad2) .. esc(right), style = "bar" }
+
+	ed:renderBody(rows, 2, textRows, { cols = s.cols })
+
+	local msgRow = textRows + 2
+	if self.prompt then
+		rows[msgRow] = "<b>" .. esc(self.prompt.label .. self.prompt.text) .. "</b>"
+	elseif self.msg ~= "" then
+		rows[msgRow] = string.rep(" ", math.max(0, math.floor((s.cols - #self.msg) / 2))) .. esc(self.msg)
+	else
+		rows[msgRow] = ""
+	end
+
+	local function helpRow(items)
+		local colw = math.max(10, math.floor(s.cols / #items))
+		local parts = {}
+		for _, it in ipairs(items) do
+			local used = #it[1] + 1 + #it[2]
+			parts[#parts + 1] = inv(term, it[1]) .. " " .. esc(it[2]) .. string.rep(" ", math.max(1, colw - used))
+		end
+		return table.concat(parts)
+	end
+	rows[textRows + 3] = helpRow(NANO_HELP1)
+	rows[textRows + 4] = helpRow(NANO_HELP2)
+
+	local cur
+	if self.prompt then
+		cur = { row = msgRow, col = #self.prompt.label + #self.prompt.text + 1, style = "bar" }
+	else
+		cur = { row = ed.cy - ed.top + 2, col = ed.cx - ed.left, style = "bar" }
+	end
+	s:Render(rows, cur)
+end
+
+function Nano:promptStart(label, text, onEnter, yn)
+	self.prompt = { label = label, text = text or "", onEnter = onEnter, yn = yn }
+end
+
+function Nano:writeOut(thenExit)
+	local ed = self.ed
+	self:promptStart("File Name to Write: ", ed.path or "", function(t)
+		if t == "" then self.msg = "[ Cancelled ]" return end
+		local ok, l = ed:save(t)
+		if ok then
+			self.msg = string.format("[ Wrote %d lines ]", l)
+			if thenExit then self.screen:Close() end
+		else
+			self.msg = "[ Error writing " .. t .. ": " .. tostring(l) .. " ]"
+		end
+	end)
+end
+
+function Nano:exit()
+	if not self.ed.modified then
+		self.screen:Close()
+		return
+	end
+	self:promptStart("Save modified buffer?  (Y/N, Esc to cancel)", "", function(c)
+		if c == "n" then self.screen:Close() else self:writeOut(true) end
+	end, true)
+end
+
+function Nano:search()
+	local ed = self.ed
+	self:promptStart("Search: ", self.lastSearch or "", function(pat)
+		if pat == "" then return end
+		self.lastSearch = pat
+		local total = #ed.lines
+		for i = 0, total do
+			local y = ((ed.cy - 1 + i) % total) + 1
+			local idx = ed.lines[y]:find(pat, (i == 0) and (ed.cx + 1) or 1, true)
+			if idx then ed.cy, ed.cx = y, idx; return end
+		end
+		self.msg = '[ "' .. pat .. '" not found ]'
+	end)
+end
+
+function Nano:onKey(k)
+	local ed, name = self.ed, k.name
+	if self.prompt then
+		local p = self.prompt
+		if name == "Escape" or (k.ctrl and name == "c") then
+			self.prompt = nil
+			self.msg = "[ Cancelled ]"
+		elseif not p.yn then
+			if name == "Enter" then
+				self.prompt = nil
+				p.onEnter(p.text)
+			elseif name == "Backspace" then
+				p.text = p.text:sub(1, -2)
+			end
+		end
+		self:render()
+		return
+	end
+	self.msg = ""
+	local line = ed:curLine()
+	local textRows = math.max(1, self.screen.rows - 4)
+	local isEdit = name == "Backspace" or name == "Enter" or name == "Delete" or name == "Tab"
+	if not isEdit then self.typing = false end
+	if isEdit and not self.typing and not k.ctrl then ed:snap(); self.typing = true end
+
+	if k.ctrl then
+		if name == "x" then self:exit()
+		elseif name == "o" then self:writeOut(false)
+		elseif name == "w" then self:search()
+		elseif name == "_" or name == "t" then
+			self:promptStart("Enter line number: ", "", function(t)
+				local n = tonumber(t)
+				if n then ed.cy, ed.cx = math.max(1, math.min(n, #ed.lines)), 1 else self.msg = "[ Invalid line number ]" end
+			end)
+		elseif name == "k" then
+			ed:snap()
+			if self.lastCut and self.cutBuf then self.cutBuf[#self.cutBuf + 1] = line else self.cutBuf = { line } end
+			if #ed.lines == 1 then ed.lines[1] = "" else table.remove(ed.lines, ed.cy) end
+			ed:clamp(true)
+			ed.cx, ed.modified = 1, true
+			self.lastCut = true
+			self:render()
+			return
+		elseif name == "u" then
+			if self.cutBuf then
+				ed:snap()
+				for i, l in ipairs(self.cutBuf) do table.insert(ed.lines, ed.cy + i - 1, l) end
+				ed.cy, ed.cx, ed.modified = ed.cy + #self.cutBuf, 1, true
+				ed:clamp(true)
+			end
+		elseif name == "c" then
+			local total = 0
+			for _, l in ipairs(ed.lines) do total = total + #l + 1 end
+			self.msg = string.format("[ line %d/%d (%d%%), col %d/%d ]", ed.cy, #ed.lines,
+				math.floor(ed.cy / #ed.lines * 100), ed.cx, #line + 1)
+		elseif name == "g" then
+			self.msg = "[ ^O save, ^X exit, ^K cut line, ^U paste, ^W search, ^_ go to line, M-U undo ]"
+		elseif name == "a" then ed.cx = 1
+		elseif name == "e" then ed.cx = #line + 1
+		elseif name == "y" then ed.cy = ed.cy - textRows; ed.top = ed.top - textRows; ed:clamp(true)
+		elseif name == "z" then
+			if ed:doUndo() then ed:clamp(true) else self.msg = "[ Nothing to undo ]" end
+		end
+	elseif k.alt then
+		if name == "u" then
+			if ed:doUndo() then ed:clamp(true) else self.msg = "[ Nothing to undo ]" end
+		elseif name == "e" then
+			if ed:doRedo() then ed:clamp(true) else self.msg = "[ Nothing to redo ]" end
+		end
+	else
+		if name == "Enter" then ed:newline()
+		elseif name == "Backspace" then ed:backspace()
+		elseif name == "Delete" then ed:delete()
+		elseif name == "Tab" then ed:insertText("    ")
+		elseif name == "Left" then
+			if ed.cx > 1 then ed.cx = ed.cx - 1
+			elseif ed.cy > 1 then ed.cy = ed.cy - 1; ed.cx = #ed.lines[ed.cy] + 1 end
+		elseif name == "Right" then
+			if ed.cx <= #line then ed.cx = ed.cx + 1
+			elseif ed.cy < #ed.lines then ed.cy = ed.cy + 1; ed.cx = 1 end
+		elseif name == "Up" then ed.cy = ed.cy - 1; ed:clamp(true)
+		elseif name == "Down" then ed.cy = ed.cy + 1; ed:clamp(true)
+		elseif name == "Home" then ed.cx = 1
+		elseif name == "End" then ed.cx = #line + 1
+		elseif name == "PageUp" then ed.cy = ed.cy - textRows; ed.top = ed.top - textRows; ed:clamp(true)
+		elseif name == "PageDown" then ed.cy = ed.cy + textRows; ed.top = ed.top + textRows; ed:clamp(true)
+		end
+	end
+	self.lastCut = false
+	self:render()
+end
+
+function Nano:onChar(text)
+	if not self.screen or self.screen.closed then return end
+	if self.prompt then
+		local p = self.prompt
+		if p.yn then
+			local c = text:lower():sub(1, 1)
+			if c == "y" or c == "n" then
+				self.prompt = nil
+				p.onEnter(c)
+			end
+		else
+			p.text = p.text .. text
+		end
+		self:render()
+		return
+	end
+	if not self.typing then
+		self.ed:snap()
+		self.typing = true
+	end
+	self.msg = ""
+	self.lastCut = false
+	self.ed:insertText(text)
+	self:render()
+end
+
+---------------------------------------------------------------------- pager --
+
+-- lines: array of plain strings. Used by less, more and man.
+function Terminal:_pager(lines, title)
+	local top, searchPat, mode, cmd = 1, nil, "view", ""
+	local screen
+	local function maxTop() return math.max(1, #lines - (screen.rows - 1) + 1) end
+	local function render()
+		if screen.closed then return end
+		local rows = {}
+		for i = 1, screen.rows - 1 do
+			local l = lines[top + i - 1]
+			rows[i] = l and esc(l:gsub("\t", "    "):sub(1, screen.cols)) or ('<font color="' .. hex(self.Theme.palette.blue) .. '">~</font>')
+		end
+		local status
+		if mode == "search" then
+			status = "/" .. cmd
+		else
+			local bottom = top + screen.rows - 2
+			local where = bottom >= #lines and "(END)" or string.format("%d%%", math.floor(bottom / #lines * 100))
+			status = string.format("%s  lines %d-%d/%d  %s   (q quit, / search, space/b page)", title or "", top, math.min(bottom, #lines), #lines, where)
+		end
+		rows[screen.rows] = { t = esc(status:sub(1, screen.cols)), style = "bar" }
+		screen:Render(rows, mode == "search" and { row = screen.rows, col = #cmd + 2, style = "bar" } or nil)
+	end
+	local function clamp() top = math.max(1, math.min(top, maxTop())) end
+	local function find(dir)
+		if not searchPat then return end
+		for i = 1, #lines do
+			local y = ((top - 1 + dir * i) % #lines) + 1
+			if lines[y]:find(searchPat, 1, true) then top = y; clamp(); return end
+		end
+	end
+	local function act(key)
+		local page = math.max(1, screen.rows - 2)
+		if key == "j" or key == "Down" or key == "Enter" then top = top + 1
+		elseif key == "k" or key == "Up" then top = top - 1
+		elseif key == " " or key == "f" or key == "PageDown" then top = top + page
+		elseif key == "b" or key == "PageUp" then top = top - page
+		elseif key == "d" then top = top + math.floor(page / 2)
+		elseif key == "u" then top = top - math.floor(page / 2)
+		elseif key == "g" or key == "Home" then top = 1
+		elseif key == "G" or key == "End" then top = maxTop()
+		elseif key == "n" then find(1)
+		elseif key == "N" then find(-1)
+		elseif key == "/" then mode, cmd = "search", ""
+		elseif key == "q" or key == "Escape" then screen:Close() return end
+		clamp()
+	end
+	screen = self:OpenScreen({
+		onKey = function(k)
+			if k.ctrl and k.name == "c" then screen:Close() return end
+			if mode == "search" then
+				if k.name == "Enter" then
+					mode = "view"
+					if cmd ~= "" then searchPat = cmd; find(1) end
+				elseif k.name == "Escape" then mode = "view"
+				elseif k.name == "Backspace" then
+					if cmd == "" then mode = "view" else cmd = cmd:sub(1, -2) end
+				end
+			else
+				act(k.name)
+			end
+			render()
+		end,
+		onChar = function(c)
+			if mode == "search" then cmd = cmd .. c else for i = 1, #c do act(c:sub(i, i)) end end
+			render()
+		end,
+		onResize = function() clamp(); render() end,
+	})
+	render()
+	screen:Wait()
+end
+
+--------------------------------------------------------------------- tools ----
+
+local function globToPattern(g)
+	local p = g:gsub("[%^%$%(%)%%%.%[%]%+%-]", "%%%0")
+	p = p:gsub("%*", ".*")
+	p = p:gsub("%?", ".")
+	return "^" .. p .. "$"
+end
+
+local function gatherInputs(ctx, name)
+	local items = {}
+	if #ctx.args == 0 then
+		if ctx.stdin then items[1] = { name = "-", text = ctx.stdin } end
+		return items
+	end
+	for _, a in ipairs(ctx.args) do
+		local text, err = ctx.fs:ReadFile(ctx.resolve(a))
+		if text then items[#items + 1] = { name = a, text = text } else ctx.error(name .. ": " .. a .. ": " .. err) end
+	end
+	return items
+end
+
+local function expandSet(s)
+	local out = {}
+	local i = 1
+	while i <= #s do
+		local a, dash, b = s:sub(i, i), s:sub(i + 1, i + 1), s:sub(i + 2, i + 2)
+		if dash == "-" and b ~= "" then
+			for c = a:byte(), b:byte() do out[#out + 1] = string.char(c) end
+			i = i + 3
+		else
+			out[#out + 1] = a
+			i = i + 1
+		end
+	end
+	return out
+end
+
+local function parseFields(spec)
+	local set = {}
+	for part in spec:gmatch("[^,]+") do
+		local a, b = part:match("^(%d+)-(%d+)$")
+		if a then
+			for i = tonumber(a), tonumber(b) do set[#set + 1] = i end
+		elseif tonumber(part) then
+			set[#set + 1] = tonumber(part)
+		end
+	end
+	return set
+end
+
+local function diffLines(a, b)
+	local n, m = #a, #b
+	local L = {}
+	for i = 0, n do
+		L[i] = {}
+		for j = 0, m do L[i][j] = 0 end
+	end
+	for i = n - 1, 0, -1 do
+		for j = m - 1, 0, -1 do
+			if a[i + 1] == b[j + 1] then L[i][j] = L[i + 1][j + 1] + 1
+			else L[i][j] = math.max(L[i + 1][j], L[i][j + 1]) end
+		end
+	end
+	local out, i, j = {}, 0, 0
+	while i < n and j < m do
+		if a[i + 1] == b[j + 1] then
+			i, j = i + 1, j + 1
+		elseif L[i + 1][j] >= L[i][j + 1] then
+			out[#out + 1] = { "<", a[i + 1] }
+			i = i + 1
+		else
+			out[#out + 1] = { ">", b[j + 1] }
+			j = j + 1
+		end
+	end
+	while i < n do out[#out + 1] = { "<", a[i + 1] }; i = i + 1 end
+	while j < m do out[#out + 1] = { ">", b[j + 1] }; j = j + 1 end
+	return out
+end
+
+function Terminal:_runShell(src, ctx)
+	for _, l in ipairs(splitLines(src)) do
+		if self._interrupt then break end
+		if l:match("%S") and not l:match("^%s*#") then self:_execLine(l) end
+	end
+	return self.lastStatus
+end
+
+function Terminal:_installTools()
+	local term = self
+	local function reg(n, d) term:RegisterCommand(n, d) end
+
+	local function editorCmd(name, Class, desc)
+		reg(name, { description = desc, usage = name .. " [file]", run = function(ctx)
+			if term._screen then ctx.error(name .. ": another full-screen app is open") return 1 end
+			local app = Class.new(term, ctx, ctx.args[1])
+			if app.ed.err then ctx.error(name .. ": " .. ctx.args[1] .. ": " .. app.ed.err) return 1 end
+			app:run()
+			return 0
+		end })
+	end
+	editorCmd("vim", Vim, "Vi IMproved, a modal text editor")
+	editorCmd("vi", Vim, "alias for vim")
+	editorCmd("nano", Nano, "small, friendly text editor")
+
+	reg("less", { description = "page through text", usage = "less [file]", run = function(ctx)
+		local items = gatherInputs(ctx, "less")
+		if #items == 0 then ctx.error("less: missing filename") return 1 end
+		term:_pager(splitLines(items[1].text), items[1].name == "-" and "(stdin)" or items[1].name)
+		return 0
+	end })
+	reg("more", { description = "page through text", usage = "more [file]", run = term.commands.less.run })
+
+	reg("man", { description = "show help for a command", usage = "man command", run = function(ctx)
+		local name = ctx.args[1]
+		if not name then ctx.error("What manual page do you want?") return 1 end
+		local def = term.commands[name]
+		if not def then ctx.error("No manual entry for " .. name) return 1 end
+		local lines = {
+			"NAME", "    " .. name .. (def.description and (" - " .. def.description) or ""), "",
+			"SYNOPSIS", "    " .. (def.usage or name), "",
+		}
+		if def.values and #def.values > 0 then
+			lines[#lines + 1] = "OPTIONS WITH VALUES"
+			lines[#lines + 1] = "    " .. table.concat(def.values, ", ")
+			lines[#lines + 1] = ""
+		end
+		lines[#lines + 1] = "Use '" .. name .. " --help' for a short usage line."
+		term:_pager(lines, "man " .. name)
+		return 0
+	end })
+
+	-- file operations ------------------------------------------------------
+	local function copyOrMove(ctx, move)
+		local cname = move and "mv" or "cp"
+		local args = ctx.args
+		if #args < 2 then ctx.error(cname .. ": missing destination file operand") return 1 end
+		local dest = ctx.resolve(args[#args])
+		local destNode = ctx.fs:Get(dest)
+		local destIsDir = destNode ~= nil and destNode.type == "dir"
+		if #args > 2 and not destIsDir then
+			ctx.error(cname .. ": target '" .. args[#args] .. "' is not a directory")
+			return 1
+		end
+		local status = 0
+		for i = 1, #args - 1 do
+			local src = ctx.resolve(args[i])
+			local sn = ctx.fs:Get(src)
+			if not sn then
+				ctx.error(string.format("%s: cannot stat '%s': No such file or directory", cname, args[i]))
+				status = 1
+			elseif sn.type == "dir" and not move and not (ctx.flags.r or ctx.flags.R) then
+				ctx.error(string.format("cp: -r not specified; omitting directory '%s'", args[i]))
+				status = 1
+			else
+				local target = destIsDir and (dest .. "/" .. (src:match("([^/]*)$") or "")) or dest
+				local ok, err
+				if move then ok, err = ctx.fs:Move(src, target) else ok, err = ctx.fs:Copy(src, target) end
+				if not ok then
+					ctx.error(string.format("%s: cannot %s '%s': %s", cname, move and "move" or "copy", args[i], err))
+					status = 1
+				end
+			end
+		end
+		return status
+	end
+	reg("cp", { description = "copy files", usage = "cp [-r] source... dest", run = function(ctx) return copyOrMove(ctx, false) end })
+	reg("mv", { description = "move or rename files", usage = "mv source... dest", run = function(ctx) return copyOrMove(ctx, true) end })
+
+	reg("chmod", { description = "change the executable bit", usage = "chmod [+x|-x|755|644] file...", run = function(ctx)
+		local mode = ctx.argv[2]
+		if not mode then ctx.error("chmod: missing operand") return 1 end
+		local on
+		if mode:find("+", 1, true) and mode:find("x", 1, true) then on = true
+		elseif mode:find("-", 1, true) and mode:find("x", 1, true) then on = false
+		elseif mode:match("^[0-7]+$") then on = tonumber(mode:sub(1, 1)) % 2 == 1
+		else ctx.error("chmod: invalid mode: '" .. mode .. "'") return 1 end
+		local status = 0
+		for i = 3, #ctx.argv do
+			local node = ctx.fs:Get(ctx.resolve(ctx.argv[i]))
+			if not node then
+				ctx.error("chmod: cannot access '" .. ctx.argv[i] .. "': No such file or directory")
+				status = 1
+			elseif node.type == "file" then
+				node.executable = on
+			end
+		end
+		return status
+	end })
+
+	reg("stat", { description = "show file status", usage = "stat file...", run = function(ctx)
+		local status = 0
+		for _, a in ipairs(ctx.args) do
+			local node = ctx.fs:Get(ctx.resolve(a))
+			if not node then
+				ctx.error("stat: cannot statx '" .. a .. "': No such file or directory")
+				status = 1
+			else
+				local kind = node.type == "dir" and "directory" or "regular file"
+				local perms = node.type == "dir" and "drwxr-xr-x" or (isExec(node) and "-rwxr-xr-x" or "-rw-r--r--")
+				ctx.print("  File: " .. a)
+				ctx.print(string.format("  Size: %d\tType: %s", node.type == "dir" and 4096 or #(node.content or ""), kind))
+				ctx.print("Access: " .. perms)
+				ctx.print("Modify: " .. os.date("%Y-%m-%d %H:%M:%S", node.mtime or os.time()))
+			end
+		end
+		return status
+	end })
+
+	reg("basename", { description = "strip directory from a path", usage = "basename path [suffix]", run = function(ctx)
+		local p = ctx.args[1] or ""
+		local b = p:gsub("/+$", ""):match("([^/]*)$") or ""
+		local suf = ctx.args[2]
+		if suf and b:sub(-#suf) == suf and #b > #suf then b = b:sub(1, -#suf - 1) end
+		ctx.print(b)
+	end })
+	reg("dirname", { description = "strip last component from a path", usage = "dirname path", run = function(ctx)
+		local p = (ctx.args[1] or ""):gsub("/+$", "")
+		local d = p:match("^(.*)/[^/]*$")
+		if d == nil then d = "." elseif d == "" then d = "/" end
+		ctx.print(d)
+	end })
+
+	reg("find", { description = "search for files", usage = "find [path] [-name pattern] [-type f|d]", run = function(ctx)
+		local start, pat, typ = ".", nil, nil
+		local i = 2
+		while i <= #ctx.argv do
+			local a = ctx.argv[i]
+			if a == "-name" then pat = ctx.argv[i + 1]; i = i + 1
+			elseif a == "-type" then typ = ctx.argv[i + 1]; i = i + 1
+			elseif a:sub(1, 1) ~= "-" then start = a end
+			i = i + 1
+		end
+		local lp = pat and globToPattern(pat) or nil
+		local root = ctx.fs:Get(ctx.resolve(start))
+		if not root then ctx.error("find: '" .. start .. "': No such file or directory") return 1 end
+		local function matches(name, node)
+			if lp and not name:match(lp) then return false end
+			if typ == "f" and node.type ~= "file" then return false end
+			if typ == "d" and node.type ~= "dir" then return false end
+			return true
+		end
+		local base = start:gsub("/+$", "")
+		if base == "" then base = "/" end
+		if matches(base:match("([^/]*)$"), root) then ctx.print(start) end
+		local function walk(abs, shown)
+			local list = ctx.fs:List(abs, true)
+			if not list then return end
+			for _, e in ipairs(list) do
+				local childShown = (shown == "/" and "" or shown) .. "/" .. e.name
+				if matches(e.name, e.node) then ctx.print(childShown) end
+				if e.node.type == "dir" then walk((abs == "/" and "" or abs) .. "/" .. e.name, childShown) end
+			end
+		end
+		walk(ctx.resolve(start), base)
+	end })
+
+	-- text processing -----------------------------------------------------
+	reg("sort", { description = "sort lines", usage = "sort [-r] [-n] [-u] [file...]", run = function(ctx)
+		local all = {}
+		for _, it in ipairs(gatherInputs(ctx, "sort")) do
+			for _, l in ipairs(splitLines(it.text)) do all[#all + 1] = l end
+		end
+		local function num(l) return tonumber(l:match("^%s*(-?[%d%.]+)")) or 0 end
+		table.sort(all, function(a, b)
+			if ctx.flags.n then
+				local x, y = num(a), num(b)
+				if x ~= y then return x < y end
+			end
+			return a < b
+		end)
+		if ctx.flags.r then
+			for i = 1, math.floor(#all / 2) do all[i], all[#all - i + 1] = all[#all - i + 1], all[i] end
+		end
+		local last
+		for _, l in ipairs(all) do
+			if not (ctx.flags.u and l == last) then ctx.print(l) end
+			last = l
+		end
+	end })
+
+	reg("uniq", { description = "collapse adjacent duplicate lines", usage = "uniq [-c] [file]", run = function(ctx)
+		for _, it in ipairs(gatherInputs(ctx, "uniq")) do
+			local prev, count
+			local function emit()
+				if prev ~= nil then ctx.print(ctx.flags.c and string.format("%7d %s", count, prev) or prev) end
+			end
+			for _, l in ipairs(splitLines(it.text)) do
+				if l == prev then count = count + 1 else emit(); prev, count = l, 1 end
+			end
+			emit()
+		end
+	end })
+
+	reg("cut", { description = "select fields from lines", usage = "cut -d DELIM -f FIELDS [file]", values = { "d", "f" }, run = function(ctx)
+		local delim = ctx.flags.d or "\t"
+		if type(delim) ~= "string" then delim = "\t" end
+		if type(ctx.flags.f) ~= "string" then ctx.error("cut: you must specify -f") return 1 end
+		local fields = parseFields(ctx.flags.f)
+		for _, it in ipairs(gatherInputs(ctx, "cut")) do
+			for _, l in ipairs(splitLines(it.text)) do
+				local parts = {}
+				local pos = 1
+				while true do
+					local s, e = l:find(delim, pos, true)
+					if not s then parts[#parts + 1] = l:sub(pos); break end
+					parts[#parts + 1] = l:sub(pos, s - 1)
+					pos = e + 1
+				end
+				local out = {}
+				for _, f in ipairs(fields) do if parts[f] then out[#out + 1] = parts[f] end end
+				ctx.print(table.concat(out, delim))
+			end
+		end
+	end })
+
+	reg("tr", { description = "translate or delete characters (stdin)", usage = "tr SET1 SET2  |  tr -d SET", run = function(ctx)
+		local text = ctx.stdin or ""
+		if ctx.flags.d then
+			local del = {}
+			for _, c in ipairs(expandSet(ctx.args[1] or "")) do del[c] = true end
+			ctx.write((text:gsub(".", function(c) return del[c] and "" or nil end)))
+			return 0
+		end
+		local a, b = expandSet(ctx.args[1] or ""), expandSet(ctx.args[2] or "")
+		if #a == 0 or #b == 0 then ctx.error("tr: missing operand") return 1 end
+		local map = {}
+		for i, c in ipairs(a) do map[c] = b[math.min(i, #b)] end
+		ctx.write((text:gsub(".", map)))
+	end })
+
+	reg("sed", { description = "substitute text (s/old/new/[g], plain text)", usage = "sed 's/old/new/g' [file...]", run = function(ctx)
+		local expr = table.remove(ctx.args, 1)
+		if not expr then ctx.error("sed: no script given") return 1 end
+		local d, pat, rep, flags = expr:match("^s(.)(.-)%1(.-)%1(.*)$")
+		if not d or not pat or pat == "" then ctx.error("sed: only s/old/new/[g] is supported") return 1 end
+		for _, it in ipairs(gatherInputs(ctx, "sed")) do
+			for _, l in ipairs(splitLines(it.text)) do
+				local out, pos = {}, 1
+				while true do
+					local s, e = l:find(pat, pos, true)
+					if not s then break end
+					out[#out + 1] = l:sub(pos, s - 1) .. rep
+					pos = e + 1
+					if not flags:find("g") then break end
+				end
+				out[#out + 1] = l:sub(pos)
+				ctx.print(table.concat(out))
+			end
+		end
+	end })
+
+	reg("tee", { description = "copy stdin to files and stdout", usage = "tee [-a] file...", run = function(ctx)
+		local text = ctx.stdin or ""
+		ctx.write(text)
+		for _, a in ipairs(ctx.args) do
+			local node, err = ctx.fs:WriteFile(ctx.resolve(a), text, { append = ctx.flags.a, parents = false })
+			if not node then ctx.error("tee: " .. a .. ": " .. err) end
+		end
+	end })
+
+	reg("seq", { description = "print a sequence of numbers", usage = "seq [first [step]] last", run = function(ctx)
+		local a = ctx.args
+		local first, step, last = 1, 1, nil
+		if #a == 1 then last = tonumber(a[1])
+		elseif #a == 2 then first, last = tonumber(a[1]), tonumber(a[2])
+		elseif #a >= 3 then first, step, last = tonumber(a[1]), tonumber(a[2]), tonumber(a[3]) end
+		if not (first and step and last) or step == 0 then ctx.error("seq: invalid argument") return 1 end
+		local count = 0
+		for v = first, last, step do
+			ctx.print(v)
+			count = count + 1
+			if count > 100000 then break end
+		end
+	end })
+
+	reg("diff", { description = "compare two files line by line", usage = "diff file1 file2", run = function(ctx)
+		if #ctx.args < 2 then ctx.error("diff: missing operand") return 2 end
+		local ta, ea = ctx.fs:ReadFile(ctx.resolve(ctx.args[1]))
+		if not ta then ctx.error("diff: " .. ctx.args[1] .. ": " .. ea) return 2 end
+		local tb, eb = ctx.fs:ReadFile(ctx.resolve(ctx.args[2]))
+		if not tb then ctx.error("diff: " .. ctx.args[2] .. ": " .. eb) return 2 end
+		local a, b = splitLines(ta), splitLines(tb)
+		if #a * #b > 4000000 then ctx.error("diff: files too large") return 2 end
+		local d = diffLines(a, b)
+		for _, e in ipairs(d) do
+			ctx.printc(e[1] == "<" and "red" or "green", e[1] .. " " .. e[2])
+		end
+		return #d > 0 and 1 or 0
+	end })
+
+	-- network -------------------------------------------------------------
+	local function fetch(ctx, url, cname)
+		if not url then ctx.error(cname .. ": missing URL") return nil end
+		if not url:match("^https?://") then url = "https://" .. url end
+		local ok, body = pcall(function() return game:HttpGet(url) end)
+		if not ok then
+			ctx.error(cname .. ": request failed: " .. tostring(body))
+			return nil
+		end
+		return body
+	end
+	reg("curl", { description = "fetch a URL (game:HttpGet)", usage = "curl [-o file] url", values = { "o" }, run = function(ctx)
+		local body = fetch(ctx, ctx.args[1], "curl")
+		if not body then return 1 end
+		if type(ctx.flags.o) == "string" then
+			local node, err = ctx.fs:WriteFile(ctx.resolve(ctx.flags.o), body, { parents = false })
+			if not node then ctx.error("curl: " .. ctx.flags.o .. ": " .. err) return 1 end
+		else
+			ctx.write(body)
+			if body:sub(-1) ~= "\n" then ctx.write("\n") end
+		end
+	end })
+	reg("wget", { description = "download a URL into a file", usage = "wget [-O file] url", values = { "O" }, run = function(ctx)
+		local url = ctx.args[1]
+		local body = fetch(ctx, url, "wget")
+		if not body then return 1 end
+		local name = type(ctx.flags.O) == "string" and ctx.flags.O or ((url:gsub("[?#].*$", ""):match("([^/]+)$")) or "index.html")
+		local node, err = ctx.fs:WriteFile(ctx.resolve(name), body, { parents = false })
+		if not node then ctx.error("wget: " .. name .. ": " .. err) return 1 end
+		ctx.print(string.format("saved '%s' (%d bytes)", name, #body))
+	end })
+
+	-- shell ---------------------------------------------------------------
+	reg("alias", { description = "define or list aliases", usage = "alias [name='command']", run = function(ctx)
+		if #ctx.argv < 2 then
+			local keys = {}
+			for k in pairs(term.aliases) do keys[#keys + 1] = k end
+			table.sort(keys)
+			for _, k in ipairs(keys) do ctx.print(string.format("alias %s='%s'", k, term.aliases[k])) end
+			return 0
+		end
+		for i = 2, #ctx.argv do
+			local k, v = ctx.argv[i]:match("^([^=]+)=(.*)$")
+			if k then
+				term.aliases[k] = v
+			elseif term.aliases[ctx.argv[i]] then
+				ctx.print(string.format("alias %s='%s'", ctx.argv[i], term.aliases[ctx.argv[i]]))
+			else
+				ctx.error("bash: alias: " .. ctx.argv[i] .. ": not found")
+			end
+		end
+	end })
+	reg("unalias", { description = "remove aliases", usage = "unalias name...", run = function(ctx)
+		for _, a in ipairs(ctx.args) do term.aliases[a] = nil end
+	end })
+
+	local function shellRun(ctx)
+		local path = ctx.args[1]
+		if not path then ctx.error(ctx.name .. ": missing script") return 2 end
+		local text, err = ctx.fs:ReadFile(ctx.resolve(path))
+		if not text then ctx.error(ctx.name .. ": " .. path .. ": " .. err) return 127 end
+		return term:_runShell(text, ctx)
+	end
+	reg("sh", { description = "run a shell script", usage = "sh script", run = shellRun })
+	reg("bash", { description = "run a shell script", usage = "bash script", run = shellRun })
+	reg("source", { description = "run a shell script", usage = "source script", run = shellRun })
+
+	reg("true", { description = "do nothing, successfully", run = function() return 0 end })
+	reg("false", { description = "do nothing, unsuccessfully", run = function() return 1 end })
+
+	reg("uptime", { description = "show how long the terminal has been running", run = function(ctx)
+		local up = os.clock() - term.startTime
+		ctx.print(string.format(" %s up %d min,  1 user,  load average: 0.00, 0.00, 0.00", os.date("%H:%M:%S"), math.floor(up / 60)))
+	end })
+	reg("free", { description = "show Lua memory usage", run = function(ctx)
+		ctx.print(string.format("Lua heap in use: %.2f MB", collectgarbage("count") / 1024))
+	end })
 end
 
 ---------------------------------------------------------------- builtins ------

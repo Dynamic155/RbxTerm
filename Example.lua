@@ -19,6 +19,10 @@
         walkspeed 50
         lua print(game.PlaceId)
         ls | grep load
+        nano notes.txt            (Ctrl+O save, Ctrl+X exit)
+        vim hello.lua             (i to type, Ctrl+[ then :wq)
+        less docs/readme.txt
+        find . -name "*.lua"
         neofetch
         theme dracula
 ]]
